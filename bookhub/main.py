@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import Settings
+from .extract import FORMATS as FILE_TYPES, looks_valid, split_name
 from .formats import FORMATS, parse_formats
 from .gitsync import GitSync
 from .library import find_book, library
@@ -31,11 +32,11 @@ OBSIDIAN_URI_LIMIT = 60_000
 
 MESSAGES = {
     "added": "Добавлено в очередь",
-    "rejected": "Некоторые файлы пропущены: нужен PDF не больше лимита",
-    "nothing": "Выберите PDF или вставьте ссылку",
+    "rejected": "Некоторые файлы пропущены: формат не поддерживается, файл повреждён или больше лимита",
+    "nothing": "Выберите файл книги или вставьте ссылку",
     "badurl": "Нужна ссылка вида https://…",
     "more": "Новые форматы добавлены в очередь",
-    "nosource": "Исходник этой книги не найден — загрузите PDF заново",
+    "nosource": "Исходник этой книги не найден — загрузите файл книги заново",
     "started": "Обработка запущена — страница обновится сама",
     "busy": "Уже идёт обработка, подождите",
     "nokey": "Не задан GEMINI_API_KEY — конспекты делать нечем",
@@ -141,7 +142,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             return "nokey"
         if proc.busy:
             return "busy"
-        if not store.list("queued") and not any(p.suffix.lower() == ".pdf" for p in s.inbox.iterdir()):
+        if not store.list("queued") and not any(split_name(p.name)[1] for p in s.inbox.iterdir()):
             return "empty"
         t = asyncio.create_task(proc.run(limit))
         tasks.add(t)
@@ -164,26 +165,28 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             "books": await asyncio.to_thread(library, s.books_dir),
             "formats": FORMATS,
             "checked": s.default_formats,
+            "file_types": sorted(set(FILE_TYPES.values()), key=list(FILE_TYPES.values()).index),
             "busy": proc.busy or any(j.status == "processing" for j in jobs),
             "has_key": summarizer is not None,
             "git": git,
         })
 
-    async def save_pdf(f: UploadFile) -> Path | None:
-        """Сохраняет PDF в inbox. None — если это не PDF или он больше лимита."""
+    async def save_file(f: UploadFile) -> Path | None:
+        """Сохраняет книгу в inbox. None — если формат не поддерживается, файл битый или больше лимита."""
         limit = s.max_upload_mb * 1024 * 1024
-        if not (f.filename or "").lower().endswith(".pdf"):
+        raw_stem, ext = split_name(Path(f.filename or "").name)
+        if not ext:
             return None
-        stem = safe_filename(Path(f.filename or "").stem, "book")
+        stem = safe_filename(raw_stem, "book")
         # Имя не должно совпасть ни с файлом в inbox, ни с уже обработанной книгой.
-        dest, n = s.inbox / f"{stem}.pdf", 2
-        while dest.exists() or store.has_source("pdf", dest.name):
-            dest, n = s.inbox / f"{stem} ({n}).pdf", n + 1
-        tmp = dest.with_suffix(".part")
+        dest, n = s.inbox / f"{stem}{ext}", 2
+        while dest.exists() or store.has_file(dest.name):
+            dest, n = s.inbox / f"{stem} ({n}){ext}", n + 1
+        tmp = s.inbox / f".{dest.name}.part"
         size, ok = 0, True
         with tmp.open("wb") as out:
             while chunk := await f.read(1024 * 1024):
-                if size == 0 and not chunk.startswith(b"%PDF"):
+                if size == 0 and not looks_valid(ext, chunk[:4096]):
                     ok = False
                     break
                 size += len(chunk)
@@ -207,9 +210,9 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             return back("nothing")
         rejected = 0
         for f in files:
-            dest = await save_pdf(f)
+            dest = await save_file(f)
             if dest:
-                store.add("pdf", dest.name, dest.stem, picked)
+                store.add("file", dest.name, split_name(dest.name)[0], picked)
             else:
                 rejected += 1
         if url:
@@ -231,7 +234,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     @app.post("/jobs/{job_id}/delete")
     async def delete(job_id: int, _: str = Depends(auth)):
         job = store.delete(job_id)
-        if job and job.kind == "pdf" and job.status != "done":
+        if job and job.is_file and job.status != "done":
             (s.inbox / Path(job.source).name).unlink(missing_ok=True)
         return back("deleted")
 
@@ -262,8 +265,8 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         src = book.source
         if src.startswith(("http://", "https://")):
             store.add("url", src, book.name, picked, book=book.name)
-        elif src and proc.find_pdf(src):
-            store.add("pdf", Path(src).name, book.name, picked, book=book.name)
+        elif src and proc.find_file(src):
+            store.add("file", Path(src).name, book.name, picked, book=book.name)
         else:
             return back("nosource")
         return back("more")

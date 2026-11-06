@@ -10,6 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import Settings
+from .extract import djvu_to_pdf, split_name
 from .formats import FORMATS
 from .gitsync import GitSync
 from .store import Job, JobStore
@@ -45,15 +46,16 @@ class Processor:
         return self._lock.locked()
 
     def sync_inbox(self) -> int:
-        """PDF, положенные в data/inbox вручную, тоже попадают в очередь."""
+        """Книги, положенные в data/inbox вручную, тоже попадают в очередь."""
         added = 0
         for p in sorted(self.s.inbox.iterdir()):
-            if p.is_file() and p.suffix.lower() == ".pdf" and not self.store.has_source("pdf", p.name):
-                self.store.add("pdf", p.name, p.stem, self.s.default_formats)
+            stem, ext = split_name(p.name)
+            if p.is_file() and ext and not self.store.has_file(p.name):
+                self.store.add("file", p.name, stem, self.s.default_formats)
                 added += 1
         return added
 
-    def find_pdf(self, name: str) -> Path | None:
+    def find_file(self, name: str) -> Path | None:
         for folder in (self.s.inbox, self.s.archive):
             path = folder / Path(name).name
             if path.is_file():
@@ -84,21 +86,26 @@ class Processor:
         try:
             if not self.summarizer:
                 raise SummaryError("GEMINI_API_KEY не задан")
-            source: Path | str = job.source
-            if job.kind == "pdf":
-                pdf = self.find_pdf(job.source)
-                if not pdf:
-                    raise SummaryError("Файл PDF не найден ни в inbox, ни в archive")
-                if pdf.parent == self.s.inbox:
-                    # Сразу переносим в архив: из inbox — только то, что ещё ждёт очереди.
-                    dest = unique_path(self.s.archive, pdf.stem, pdf.suffix)
-                    shutil.move(str(pdf), dest)
-                    self.store.set_source(job.id, dest.name)
-                    pdf = dest
-                source = pdf
             progress = lambda text: self.store.set_progress(job.id, text)  # noqa: E731
-            for summary in self.summarizer.run(job.kind, source, job.pending_formats, job.book, progress):
-                note = self._write(summary, Path(source).name if job.kind == "pdf" else job.source)
+            source: Path | str = job.source
+            kind = "url"
+            if job.is_file:
+                kind = "file"
+                book_file = self.find_file(job.source)
+                if not book_file:
+                    raise SummaryError("Файл книги не найден ни в inbox, ни в archive")
+                if book_file.parent == self.s.inbox:
+                    # Сразу переносим в архив: в inbox лежит только то, что ещё ждёт очереди.
+                    dest = unique_path(self.s.archive, *split_name(book_file.name))
+                    shutil.move(str(book_file), dest)
+                    self.store.set_source(job.id, dest.name)
+                    book_file = dest
+                source = book_file
+                if split_name(book_file.name)[1] in (".djvu", ".djv"):
+                    progress("конвертирую DjVu в PDF")
+                    source = djvu_to_pdf(book_file, self.s.data_dir / "cache")
+            for summary in self.summarizer.run(kind, source, job.pending_formats, job.book, progress):
+                note = self._write(summary, Path(job.source).name if job.is_file else job.source)
                 self.store.format_done(job.id, summary.fmt, summary.book, note.name)
                 written.append(note.stem)
             self.store.mark_done(job.id)

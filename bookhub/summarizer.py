@@ -11,11 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
+from .extract import extract_text, split_name
 from .formats import FORMATS, HEADER, compress_prompt
 
 log = logging.getLogger(__name__)
 
 MAX_URL_TEXT = 400_000
+MAX_BOOK_TEXT = 2_000_000  # ~0,5–0,7 млн токенов: с запасом влезает в контекст Gemini
 UPLOAD_TIMEOUT_S = 600
 CHUNK_WORDS = 6000  # сколько слов оригинала отправлять в одном запросе при сжатии
 CHUNK_MAX_PAGES = 30
@@ -194,21 +196,31 @@ class GeminiSummarizer:
     # ----- основной вход -----
     def run(self, kind: str, source: Path | str, formats: list[str], book: str | None,
             progress: Progress) -> Iterator[Summary]:
+        """kind: "url" — ссылка; "file" (или старое "pdf") — путь к файлу книги."""
         whole = [f for f in formats if not FORMATS[f].ratio]
         squeeze = [f for f in formats if FORMATS[f].ratio]
-        fallback = Path(source).stem if kind == "pdf" else "Статья"
+        is_pdf = kind != "url" and Path(source).suffix.lower() == ".pdf"
+        material: object = None
+        text = ""
 
         if kind == "url":
             progress("скачиваю страницу")
-            text, page_title = fetch_article(str(source))
-            fallback = page_title
-            material: object = f"Источник: {source}\nЗаголовок страницы: {page_title}\n\n{text}"
+            text, fallback = fetch_article(str(source))
+            material = f"Источник: {source}\nЗаголовок страницы: {fallback}\n\n{text}"
+        elif is_pdf:
+            fallback = split_name(Path(source).name)[0]
         else:
-            material = None
+            progress("читаю файл")
+            book_file = extract_text(Path(source))
+            text = book_file.text
+            fallback = (f"{book_file.title} - {book_file.author}" if book_file.title and book_file.author
+                        else book_file.title or split_name(Path(source).name)[0])
+            material = "\n".join(x for x in (f"Книга (файл {Path(source).name}).", book_file.hint) if x)
+            material += "\n\n" + text[:MAX_BOOK_TEXT]
 
         if whole:
             up = None
-            if kind == "pdf":
+            if is_pdf:
                 progress("загружаю PDF в Gemini")
                 up = self._upload(str(source), "этот PDF")
                 material = up
@@ -223,7 +235,7 @@ class GeminiSummarizer:
                     self._forget(up)
 
         for fmt in squeeze:
-            if kind == "pdf":
+            if is_pdf:
                 summary = self._compress_pdf(Path(source), fmt, book, fallback, progress)
             else:
                 summary = self._compress_text(text, fmt, book, fallback, progress)

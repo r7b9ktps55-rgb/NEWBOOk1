@@ -14,8 +14,8 @@
 
 <form action="/add" method="post" enctype="multipart/form-data" class="card">
   <h2>Добавить книгу</h2>
-  <label class="field"><span>PDF-файлы (до {{ s.max_upload_mb }} МБ)</span>
-    <input type="file" name="files" multiple accept=".pdf,application/pdf"></label>
+  <label class="field"><span>Файлы книг: {{ file_types|join(", ") }} — до {{ s.max_upload_mb }} МБ</span>
+    <input type="file" name="files" multiple></label>
   <label class="field"><span>или ссылка на статью</span>
     <input type="url" name="url" placeholder="https://…"></label>
   {{ picker(formats, checked) }}
@@ -35,7 +35,7 @@
     <li>
       <div class="row">
         <span class="badge {{ j.status }}">{{ {'queued': 'в очереди', 'processing': 'в работе', 'error': 'ошибка'}[j.status] }}</span>
-        <span class="kind">{{ 'PDF' if j.kind == 'pdf' else 'URL' }}</span>
+        <span class="kind">{{ j.type_label }}</span>
         <span class="title" title="{{ j.source }}">{{ j.title }}</span>
         {% if j.status != 'processing' %}
         <span class="actions">
@@ -54,7 +54,7 @@
     </li>
     {% endfor %}
   </ul>
-  {% else %}<p class="empty">Пусто. Добавьте PDF или ссылку.</p>{% endif %}
+  {% else %}<p class="empty">Пусто. Добавьте книгу или ссылку.</p>{% endif %}
 </section>
 
 <section class="card">

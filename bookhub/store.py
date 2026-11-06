@@ -11,7 +11,7 @@ from pathlib import Path
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('pdf', 'url')),
+    kind TEXT NOT NULL CHECK (kind IN ('file', 'url', 'pdf')),
     source TEXT NOT NULL,
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
@@ -50,6 +50,16 @@ class Job:
     book: str | None = None
 
     @property
+    def is_file(self) -> bool:
+        return self.kind != "url"  # 'pdf' — старое название для файлов
+
+    @property
+    def type_label(self) -> str:
+        from .extract import label
+
+        return "URL" if self.kind == "url" else label(self.source)
+
+    @property
     def format_list(self) -> list[str]:
         return [f for f in self.formats.split(",") if f]
 
@@ -72,12 +82,25 @@ class JobStore:
         self._lock = threading.Lock()
         with self._conn() as c:
             c.execute(SCHEMA)
-            have = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
-            for col, decl in MIGRATIONS.items():
-                if col not in have:
-                    c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
+            self._add_columns(c)
+            # Старые базы разрешали только 'pdf' и 'url' — пересоздаём таблицу с новым ограничением.
+            sql = c.execute("SELECT sql FROM sqlite_master WHERE name='jobs'").fetchone()[0]
+            if "'file'" not in sql:
+                c.execute("ALTER TABLE jobs RENAME TO jobs_old")
+                c.execute(SCHEMA)
+                self._add_columns(c)
+                cols = ", ".join(r["name"] for r in c.execute("PRAGMA table_info(jobs_old)"))
+                c.execute(f"INSERT INTO jobs ({cols}) SELECT {cols} FROM jobs_old")
+                c.execute("DROP TABLE jobs_old")
             # Если приложение упало посреди обработки — вернуть задачу в очередь.
             c.execute("UPDATE jobs SET status='queued', updated_at=? WHERE status='processing'", (_now(),))
+
+    @staticmethod
+    def _add_columns(c: sqlite3.Connection) -> None:
+        have = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
+        for col, decl in MIGRATIONS.items():
+            if col not in have:
+                c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10)
@@ -103,8 +126,8 @@ class JobStore:
         rows = self._run("SELECT * FROM jobs WHERE id=?", (job_id,))
         return rows[0] if rows else None
 
-    def has_source(self, kind: str, source: str) -> bool:
-        return bool(self._run("SELECT * FROM jobs WHERE kind=? AND source=? LIMIT 1", (kind, source)))
+    def has_file(self, name: str) -> bool:
+        return bool(self._run("SELECT * FROM jobs WHERE kind!='url' AND source=? LIMIT 1", (name,)))
 
     def list(self, *statuses: str) -> list[Job]:
         if statuses:
