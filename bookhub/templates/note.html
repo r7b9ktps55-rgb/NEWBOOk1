@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Book Hub{% endblock %}
+{% block content %}
+<p><a href="/" class="back">← Назад</a></p>
+<article class="card note">
+  <h1>{{ title }}</h1>
+  <div class="toolbar">
+    {% if obsidian_uri %}<a class="btn primary" href="{{ obsidian_uri }}">Открыть в Obsidian</a>{% endif %}
+    <button class="btn" type="button" data-copy="raw">Скопировать Markdown</button>
+    <a class="btn" href="/notes/{{ name|urlencode }}/download">Скачать .md</a>
+    <form action="/notes/{{ name|urlencode }}/delete" method="post" data-confirm="Удалить заметку «{{ title }}»?">
+      <button class="btn ghost">Удалить</button>
+    </form>
+  </div>
+  {% if front %}<pre class="front">{{ front }}</pre>{% endif %}
+  <div class="md">{{ html|safe }}</div>
+  <textarea id="raw" hidden readonly>{{ raw }}</textarea>
+</article>
+{% endblock %}

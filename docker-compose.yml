@@ -1,0 +1,12 @@
+services:
+  bookhub:
+    build: .
+    container_name: bookhub
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # По умолчанию сайт доступен только с этого компьютера.
+      # Чтобы открыть его в локальной сети, поставьте BIND=0.0.0.0 в .env.
+      - "${BIND:-127.0.0.1}:${PORT:-8080}:8080"
+    volumes:
+      - ./data:/app/data
