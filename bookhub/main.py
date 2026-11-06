@@ -18,7 +18,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import Settings
+from .formats import FORMATS, parse_formats
 from .gitsync import GitSync
+from .library import find_book, library
 from .store import JobStore
 from .summarizer import GeminiSummarizer, Summarizer, safe_filename
 from .worker import Processor
@@ -28,10 +30,12 @@ HERE = Path(__file__).parent
 OBSIDIAN_URI_LIMIT = 60_000
 
 MESSAGES = {
-    "uploaded": "PDF добавлены в очередь",
+    "added": "Добавлено в очередь",
     "rejected": "Некоторые файлы пропущены: нужен PDF не больше лимита",
-    "url": "Ссылка добавлена в очередь",
+    "nothing": "Выберите PDF или вставьте ссылку",
     "badurl": "Нужна ссылка вида https://…",
+    "more": "Новые форматы добавлены в очередь",
+    "nosource": "Исходник этой книги не найден — загрузите PDF заново",
     "started": "Обработка запущена — страница обновится сама",
     "busy": "Уже идёт обработка, подождите",
     "nokey": "Не задан GEMINI_API_KEY — конспекты делать нечем",
@@ -54,9 +58,11 @@ def render_note(text: str) -> tuple[str, str]:
         if end != -1:
             front, text = text[4:end].strip(), text[end + 4:].lstrip("\n")
     text = text.replace("&", "&amp;").replace("<", "&lt;")
+    # Карточки «Вопрос::Ответ» показываем списком
+    text = re.sub(r"^(?![\s>#*-])(.+?)::(.+)$", r"- **\1** — \2", text, flags=re.M)
     text = re.sub(r"^(\s*[-*]) \[ \]", r"\1 ☐", text, flags=re.M)
     text = re.sub(r"^(\s*[-*]) \[[xX]\]", r"\1 ☑", text, flags=re.M)
-    html = md.markdown(text, extensions=["extra", "sane_lists"])
+    html = md.markdown(text, extensions=["extra", "sane_lists", "nl2br"])
     html = re.sub(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", lambda m: f'<span class="wikilink">{m.group(2) or m.group(1)}</span>', html)
     html = re.sub(r"\[!(\w+)\]", r'<span class="callout">\1</span>', html)
     return front, html
@@ -72,7 +78,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         log.warning("WEB_PASSWORD слишком простой — смените его, если сайт доступен из интернета")
 
     if summarizer is None and s.gemini_api_key:
-        summarizer = GeminiSummarizer(s.gemini_api_key, s.gemini_model, s.timezone, s.prompt_file)
+        summarizer = GeminiSummarizer(s.gemini_api_key, s.gemini_model, s.data_dir)
     store = JobStore(s.db_path)
     git = GitSync(s)
     proc = Processor(s, store, summarizer, git)
@@ -151,61 +157,67 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         await asyncio.to_thread(proc.sync_inbox)
         jobs = store.list()
         active = [j for j in jobs if j.status != "done"]
-        notes = sorted(s.books_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
         return templates.TemplateResponse(request, "index.html", {
             "s": s,
             "message": MESSAGES.get(m, ""),
             "active": active,
-            "done_count": len(jobs) - len(active),
-            "notes": [p.stem for p in notes],
+            "books": await asyncio.to_thread(library, s.books_dir),
+            "formats": FORMATS,
+            "checked": s.default_formats,
             "busy": proc.busy or any(j.status == "processing" for j in jobs),
             "has_key": summarizer is not None,
             "git": git,
         })
 
-    @app.post("/upload")
-    async def upload(files: list[UploadFile] = File(...), _: str = Depends(auth)):
+    async def save_pdf(f: UploadFile) -> Path | None:
+        """Сохраняет PDF в inbox. None — если это не PDF или он больше лимита."""
         limit = s.max_upload_mb * 1024 * 1024
+        if not (f.filename or "").lower().endswith(".pdf"):
+            return None
+        stem = safe_filename(Path(f.filename or "").stem, "book")
+        # Имя не должно совпасть ни с файлом в inbox, ни с уже обработанной книгой.
+        dest, n = s.inbox / f"{stem}.pdf", 2
+        while dest.exists() or store.has_source("pdf", dest.name):
+            dest, n = s.inbox / f"{stem} ({n}).pdf", n + 1
+        tmp = dest.with_suffix(".part")
+        size, ok = 0, True
+        with tmp.open("wb") as out:
+            while chunk := await f.read(1024 * 1024):
+                if size == 0 and not chunk.startswith(b"%PDF"):
+                    ok = False
+                    break
+                size += len(chunk)
+                if size > limit:
+                    ok = False
+                    break
+                out.write(chunk)
+        if ok and size:
+            tmp.rename(dest)
+            return dest
+        tmp.unlink(missing_ok=True)
+        return None
+
+    @app.post("/add")
+    async def add(files: list[UploadFile] = File([]), url: str = Form(""), formats: list[str] = Form([]),
+                  _: str = Depends(auth)):
+        picked = parse_formats(formats, list(s.default_formats))
+        files = [f for f in files if f.filename]
+        url = url.strip()
+        if not files and not url:
+            return back("nothing")
         rejected = 0
         for f in files:
-            stem = safe_filename(Path(f.filename or "").stem, "book")
-            if not (f.filename or "").lower().endswith(".pdf"):
-                rejected += 1
-                continue
-            # Имя не должно совпасть ни с файлом в inbox, ни с уже обработанной книгой.
-            dest, n = s.inbox / f"{stem}.pdf", 2
-            while dest.exists() or store.has_source("pdf", dest.name):
-                dest, n = s.inbox / f"{stem} ({n}).pdf", n + 1
-            tmp = dest.with_suffix(".part")
-            size, ok = 0, True
-            with tmp.open("wb") as out:
-                first = True
-                while chunk := await f.read(1024 * 1024):
-                    if first and not chunk.startswith(b"%PDF"):
-                        ok = False
-                        break
-                    first = False
-                    size += len(chunk)
-                    if size > limit:
-                        ok = False
-                        break
-                    out.write(chunk)
-            if ok and size:
-                tmp.rename(dest)
-                store.add("pdf", dest.name, dest.stem)
+            dest = await save_pdf(f)
+            if dest:
+                store.add("pdf", dest.name, dest.stem, picked)
             else:
-                tmp.unlink(missing_ok=True)
                 rejected += 1
-        return back("rejected" if rejected else "uploaded")
-
-    @app.post("/url")
-    async def add_url(url: str = Form(...), _: str = Depends(auth)):
-        url = url.strip()
-        parts = urllib.parse.urlsplit(url)
-        if parts.scheme not in ("http", "https") or not parts.netloc or len(url) > 2000:
-            return back("badurl")
-        store.add("url", url, url)
-        return back("url")
+        if url:
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme not in ("http", "https") or not parts.netloc or len(url) > 2000:
+                return back("badurl")
+            store.add("url", url, url, picked)
+        return back("rejected" if rejected else "added")
 
     @app.post("/run")
     async def run(all: str = Form(""), _: str = Depends(auth)):
@@ -233,10 +245,28 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         if s.obsidian_vault_name:
             params = {"vault": s.obsidian_vault_name, **params}
         uri = "obsidian://new?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+        book = await asyncio.to_thread(find_book, s.books_dir, path.name)
         return templates.TemplateResponse(request, "note.html", {
             "title": path.stem, "name": path.name, "front": front, "html": html, "raw": text,
             "obsidian_uri": uri if len(uri) <= OBSIDIAN_URI_LIMIT else "",
+            "book": book, "formats": FORMATS, "has_key": summarizer is not None,
         })
+
+    @app.post("/notes/{name}/more")
+    async def more_formats(name: str, formats: list[str] = Form([]), _: str = Depends(auth)):
+        note_path(name)
+        book = find_book(s.books_dir, name)
+        picked = [f for f in parse_formats(formats, []) if not book or f not in book.formats]
+        if not book or not picked:
+            return back("nothing")
+        src = book.source
+        if src.startswith(("http://", "https://")):
+            store.add("url", src, book.name, picked, book=book.name)
+        elif src and proc.find_pdf(src):
+            store.add("pdf", Path(src).name, book.name, picked, book=book.name)
+        else:
+            return back("nosource")
+        return back("more")
 
     @app.get("/notes/{name}/download")
     async def download(name: str, _: str = Depends(auth)):

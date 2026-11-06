@@ -22,6 +22,14 @@ CREATE TABLE IF NOT EXISTS jobs (
 )
 """
 
+# Колонки, добавленные позже: старые базы дополняются при запуске.
+MIGRATIONS = {
+    "formats": "TEXT NOT NULL DEFAULT 'summary'",
+    "done_formats": "TEXT NOT NULL DEFAULT ''",
+    "progress": "TEXT",
+    "book": "TEXT",
+}
+
 STATUSES = ("queued", "processing", "done", "error")
 
 
@@ -36,6 +44,22 @@ class Job:
     note: str | None
     created_at: str
     updated_at: str
+    formats: str = "summary"
+    done_formats: str = ""
+    progress: str | None = None
+    book: str | None = None
+
+    @property
+    def format_list(self) -> list[str]:
+        return [f for f in self.formats.split(",") if f]
+
+    @property
+    def done_list(self) -> list[str]:
+        return [f for f in self.done_formats.split(",") if f]
+
+    @property
+    def pending_formats(self) -> list[str]:
+        return [f for f in self.format_list if f not in self.done_list]
 
 
 def _now() -> str:
@@ -48,6 +72,10 @@ class JobStore:
         self._lock = threading.Lock()
         with self._conn() as c:
             c.execute(SCHEMA)
+            have = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
+            for col, decl in MIGRATIONS.items():
+                if col not in have:
+                    c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
             # Если приложение упало посреди обработки — вернуть задачу в очередь.
             c.execute("UPDATE jobs SET status='queued', updated_at=? WHERE status='processing'", (_now(),))
 
@@ -60,12 +88,13 @@ class JobStore:
         with self._lock, self._conn() as c:
             return [Job(**dict(r)) for r in c.execute(sql, args).fetchall()]
 
-    def add(self, kind: str, source: str, title: str) -> Job:
+    def add(self, kind: str, source: str, title: str, formats: list[str] | None = None,
+            book: str | None = None) -> Job:
         now = _now()
         with self._lock, self._conn() as c:
             cur = c.execute(
-                "INSERT INTO jobs (kind, source, title, created_at, updated_at) VALUES (?,?,?,?,?)",
-                (kind, source, title, now, now),
+                "INSERT INTO jobs (kind, source, title, formats, book, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (kind, source, title, ",".join(formats or ["summary"]), book, now, now),
             )
             job_id = cur.lastrowid
         return self.get(job_id)  # type: ignore[return-value]
@@ -88,17 +117,28 @@ class JobStore:
             row = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
             if not row:
                 return None
-            c.execute("UPDATE jobs SET status='processing', error=NULL, updated_at=? WHERE id=?", (_now(), row["id"]))
+            c.execute("UPDATE jobs SET status='processing', error=NULL, progress=NULL, updated_at=? WHERE id=?",
+                      (_now(), row["id"]))
         return self.get(row["id"])
 
-    def mark_done(self, job_id: int, note: str, title: str | None = None) -> None:
-        self._run(
-            "UPDATE jobs SET status='done', note=?, title=COALESCE(?, title), error=NULL, updated_at=? WHERE id=?",
-            (note, title, _now(), job_id),
-        )
+    def set_progress(self, job_id: int, text: str) -> None:
+        self._run("UPDATE jobs SET progress=?, updated_at=? WHERE id=?", (text, _now(), job_id))
+
+    def set_source(self, job_id: int, source: str) -> None:
+        self._run("UPDATE jobs SET source=?, updated_at=? WHERE id=?", (source, _now(), job_id))
+
+    def format_done(self, job_id: int, fmt: str, book: str, note: str) -> None:
+        job = self.get(job_id)
+        done = ",".join([*job.done_list, fmt]) if job else fmt
+        self._run("UPDATE jobs SET done_formats=?, book=?, title=?, note=?, updated_at=? WHERE id=?",
+                  (done, book, book, note, _now(), job_id))
+
+    def mark_done(self, job_id: int) -> None:
+        self._run("UPDATE jobs SET status='done', error=NULL, progress=NULL, updated_at=? WHERE id=?", (_now(), job_id))
 
     def mark_error(self, job_id: int, message: str) -> None:
-        self._run("UPDATE jobs SET status='error', error=?, updated_at=? WHERE id=?", (message[:1000], _now(), job_id))
+        self._run("UPDATE jobs SET status='error', error=?, progress=NULL, updated_at=? WHERE id=?",
+                  (message[:1000], _now(), job_id))
 
     def requeue(self, job_id: int) -> bool:
         with self._lock, self._conn() as c:

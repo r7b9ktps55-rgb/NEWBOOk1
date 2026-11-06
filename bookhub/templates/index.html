@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_formats.html" import picker %}
 {% set refresh = 10 if busy else 0 %}
 {% block header %}
 <form action="/run" method="post" class="run">
@@ -11,20 +12,15 @@
 {% if not has_key %}<p class="flash warn">Не задан <code>GEMINI_API_KEY</code> — добавьте его в <code>.env</code> и перезапустите.</p>{% endif %}
 {% if git.last_error %}<p class="flash warn">Git: {{ git.last_error }}</p>{% endif %}
 
-<section class="grid">
-  <form action="/upload" method="post" enctype="multipart/form-data" class="card">
-    <h2>PDF</h2>
-    <input type="file" name="files" multiple accept=".pdf,application/pdf" required>
-    <button class="btn">В очередь</button>
-    <p class="hint">До {{ s.max_upload_mb }} МБ. Можно и просто положить файл в <code>data/inbox</code>.</p>
-  </form>
-  <form action="/url" method="post" class="card">
-    <h2>Ссылка на статью</h2>
-    <input type="url" name="url" placeholder="https://…" required>
-    <button class="btn">В очередь</button>
-    <p class="hint">Текст страницы будет извлечён и сжат в конспект.</p>
-  </form>
-</section>
+<form action="/add" method="post" enctype="multipart/form-data" class="card">
+  <h2>Добавить книгу</h2>
+  <label class="field"><span>PDF-файлы (до {{ s.max_upload_mb }} МБ)</span>
+    <input type="file" name="files" multiple accept=".pdf,application/pdf"></label>
+  <label class="field"><span>или ссылка на статью</span>
+    <input type="url" name="url" placeholder="https://…"></label>
+  {{ picker(formats, checked) }}
+  <button class="btn primary">В очередь</button>
+</form>
 
 <section class="card">
   <h2>Очередь <span class="count">{{ active|length }}</span></h2>
@@ -46,10 +42,14 @@
           {% if j.status == 'error' %}
           <form action="/jobs/{{ j.id }}/retry" method="post"><button class="btn small">Повторить</button></form>
           {% endif %}
-          <form action="/jobs/{{ j.id }}/delete" method="post" data-confirm="Убрать из очереди?"><button class="btn small ghost">✕</button></form>
+          <form action="/jobs/{{ j.id }}/delete" method="post" data-confirm="Убрать из очереди?"><button class="btn small ghost" aria-label="Убрать">✕</button></form>
         </span>
         {% endif %}
       </div>
+      <div class="tags">
+        {% for f in j.format_list if f in formats %}<span class="tag {% if f in j.done_list %}done{% endif %}">{% if f in j.done_list %}✓ {% endif %}{{ formats[f].label }}</span>{% endfor %}
+      </div>
+      {% if j.progress and j.status == 'processing' %}<p class="progress">{{ j.progress }}…</p>{% endif %}
       {% if j.error %}<p class="error">{{ j.error }}</p>{% endif %}
     </li>
     {% endfor %}
@@ -58,11 +58,16 @@
 </section>
 
 <section class="card">
-  <h2>Конспекты <span class="count">{{ notes|length }}</span></h2>
-  {% if notes %}
-  <ul class="list notes">
-    {% for n in notes %}
-    <li><a href="/notes/{{ (n ~ '.md')|urlencode }}">{{ n }}</a></li>
+  <h2>Библиотека <span class="count">{{ books|length }}</span></h2>
+  {% if books %}
+  <ul class="list books">
+    {% for b in books %}
+    <li>
+      <a class="book" href="/notes/{{ b.notes[0].name|urlencode }}">{{ b.name }}</a>
+      <div class="tags">
+        {% for n in b.notes %}<a class="tag link" href="/notes/{{ n.name|urlencode }}">{{ n.label }}</a>{% endfor %}
+      </div>
+    </li>
     {% endfor %}
   </ul>
   {% else %}<p class="empty">Пока ничего нет.</p>{% endif %}

@@ -1,16 +1,19 @@
-"""Обработка очереди: берёт задачу, делает конспект, сохраняет заметку."""
+"""Обработка очереди: берёт задачу, делает заметки нужных форматов, сохраняет их."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import shutil
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .config import Settings
+from .formats import FORMATS
 from .gitsync import GitSync
 from .store import Job, JobStore
-from .summarizer import Summarizer, SummaryError, add_source
+from .summarizer import Summarizer, Summary, SummaryError, safe_filename, with_frontmatter
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +25,11 @@ def unique_path(folder: Path, stem: str, suffix: str) -> Path:
         path = folder / f"{stem} ({n}){suffix}"
         n += 1
     return path
+
+
+def note_stem(book: str, fmt: str) -> str:
+    suffix = FORMATS[fmt].suffix
+    return safe_filename(f"{book} ({suffix})" if suffix else book, limit=140)
 
 
 class Processor:
@@ -41,50 +49,78 @@ class Processor:
         added = 0
         for p in sorted(self.s.inbox.iterdir()):
             if p.is_file() and p.suffix.lower() == ".pdf" and not self.store.has_source("pdf", p.name):
-                self.store.add("pdf", p.name, p.stem)
+                self.store.add("pdf", p.name, p.stem, self.s.default_formats)
                 added += 1
         return added
 
+    def find_pdf(self, name: str) -> Path | None:
+        for folder in (self.s.inbox, self.s.archive):
+            path = folder / Path(name).name
+            if path.is_file():
+                return path
+        return None
+
     async def run(self, limit: int | None = 1) -> int:
-        """Обрабатывает до `limit` задач (None — всю очередь). Возвращает число готовых."""
+        """Обрабатывает до `limit` задач (None — всю очередь). Возвращает число новых заметок."""
         if self._lock.locked():
             return 0
         async with self._lock:
             await asyncio.to_thread(self.sync_inbox)
-            done: list[str] = []
+            notes: list[str] = []
             attempts = 0
             while limit is None or attempts < limit:
                 job = self.store.claim_next()
                 if not job:
                     break
                 attempts += 1
-                title = await asyncio.to_thread(self._process, job)
-                if title:
-                    done.append(title)
-            if done:
-                msg = f"Add {done[0]}" if len(done) == 1 else f"Add {len(done)} book summaries"
+                notes += await asyncio.to_thread(self._process, job)
+            if notes:
+                msg = f"Add {notes[0]}" if len(notes) == 1 else f"Add {len(notes)} book notes"
                 await asyncio.to_thread(self.git.sync, msg)
-            return len(done)
+            return len(notes)
 
-    def _process(self, job: Job) -> str | None:
+    def _process(self, job: Job) -> list[str]:
+        written: list[str] = []
         try:
             if not self.summarizer:
                 raise SummaryError("GEMINI_API_KEY не задан")
+            source: Path | str = job.source
             if job.kind == "pdf":
-                pdf = self.s.inbox / job.source
-                if not pdf.is_file():
-                    raise SummaryError("Файл PDF не найден в inbox")
-                summary = self.summarizer.summarize_pdf(pdf)
-            else:
-                summary = self.summarizer.summarize_url(job.source)
-            note = unique_path(self.s.books_dir, summary.title, ".md")
-            note.write_text(add_source(summary.markdown, job.source), "utf-8")
-            if job.kind == "pdf":
-                shutil.move(str(pdf), unique_path(self.s.archive, pdf.stem, pdf.suffix))
-            self.store.mark_done(job.id, note.name, summary.title)
-            log.info("Готово: %s -> %s", job.source, note.name)
-            return summary.title
+                pdf = self.find_pdf(job.source)
+                if not pdf:
+                    raise SummaryError("Файл PDF не найден ни в inbox, ни в archive")
+                if pdf.parent == self.s.inbox:
+                    # Сразу переносим в архив: из inbox — только то, что ещё ждёт очереди.
+                    dest = unique_path(self.s.archive, pdf.stem, pdf.suffix)
+                    shutil.move(str(pdf), dest)
+                    self.store.set_source(job.id, dest.name)
+                    pdf = dest
+                source = pdf
+            progress = lambda text: self.store.set_progress(job.id, text)  # noqa: E731
+            for summary in self.summarizer.run(job.kind, source, job.pending_formats, job.book, progress):
+                note = self._write(summary, Path(source).name if job.kind == "pdf" else job.source)
+                self.store.format_done(job.id, summary.fmt, summary.book, note.name)
+                written.append(note.stem)
+            self.store.mark_done(job.id)
+            log.info("Готово: %s -> %s", job.source, ", ".join(written))
         except Exception as exc:  # ошибка одной книги не должна ронять очередь
             log.exception("Ошибка обработки задачи %s", job.id)
-            self.store.mark_error(job.id, str(exc) or exc.__class__.__name__)
-            return None
+            done = f" (готово: {len(written)})" if written else ""
+            self.store.mark_error(job.id, (str(exc) or exc.__class__.__name__) + done)
+        return written
+
+    def _write(self, summary: Summary, source: str) -> Path:
+        meta = {
+            "title": summary.title,
+            "author": summary.author,
+            "book": summary.book,
+            "format": summary.fmt,
+            "tags": ["book", f"book/{summary.fmt}"],
+            "status": "unread",
+            "created": datetime.now(ZoneInfo(self.s.timezone)).strftime("%Y-%m-%d"),
+            "source": source,
+            **(summary.extra or {}),
+        }
+        note = unique_path(self.s.books_dir, note_stem(summary.book, summary.fmt), ".md")
+        note.write_text(with_frontmatter(summary.markdown, meta), "utf-8")
+        return note

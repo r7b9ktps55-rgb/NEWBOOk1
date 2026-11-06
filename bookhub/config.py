@@ -9,6 +9,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .formats import parse_formats
+
 
 class ConfigError(Exception):
     pass
@@ -43,6 +45,8 @@ class Settings:
     git_author_name: str = "Book Hub"
     git_author_email: str = "bookhub@localhost"
     max_upload_mb: int = 200
+    # Какие форматы отмечены по умолчанию (и для PDF, положенных в inbox вручную)
+    default_formats: tuple[str, ...] = ("summary",)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -65,6 +69,7 @@ class Settings:
             git_author_name=env("GIT_AUTHOR_NAME", "Book Hub") or "Book Hub",
             git_author_email=env("GIT_AUTHOR_EMAIL", "bookhub@localhost") or "bookhub@localhost",
             max_upload_mb=_int("MAX_UPLOAD_MB", 200),
+            default_formats=tuple(parse_formats(env("DEFAULT_FORMATS", "summary"))),
         )
 
     def validate(self) -> None:
@@ -104,11 +109,6 @@ class Settings:
     @property
     def db_path(self) -> Path:
         return self.data_dir / "bookhub.db"
-
-    @property
-    def prompt_file(self) -> Path:
-        """Если этот файл есть, его текст заменяет встроенный промпт."""
-        return self.data_dir / "prompt.md"
 
     def ensure_dirs(self) -> None:
         for d in (self.inbox, self.archive, self.books_dir):

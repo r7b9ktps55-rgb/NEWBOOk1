@@ -1,8 +1,14 @@
 {% extends "base.html" %}
+{% from "_formats.html" import picker %}
 {% block title %}{{ title }} — Book Hub{% endblock %}
 {% block content %}
 <p><a href="/" class="back">← Назад</a></p>
 <article class="card note">
+  {% if book and book.notes|length > 1 %}
+  <nav class="tags" aria-label="Форматы этой книги">
+    {% for n in book.notes %}<a class="tag link {% if n.name == name %}current{% endif %}" href="/notes/{{ n.name|urlencode }}">{{ n.label }}</a>{% endfor %}
+  </nav>
+  {% endif %}
   <h1>{{ title }}</h1>
   <div class="toolbar">
     {% if obsidian_uri %}<a class="btn primary" href="{{ obsidian_uri }}">Открыть в Obsidian</a>{% endif %}
@@ -16,4 +22,14 @@
   <div class="md">{{ html|safe }}</div>
   <textarea id="raw" hidden readonly>{{ raw }}</textarea>
 </article>
+
+{% if book and book.formats|length < formats|length %}
+<details class="card more">
+  <summary>Сделать из этой книги ещё…</summary>
+  <form action="/notes/{{ name|urlencode }}/more" method="post">
+    {{ picker(formats, (), book.formats) }}
+    <button class="btn primary" {% if not has_key %}disabled{% endif %}>В очередь</button>
+  </form>
+</details>
+{% endif %}
 {% endblock %}
