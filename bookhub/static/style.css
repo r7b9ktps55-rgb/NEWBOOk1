@@ -647,6 +647,9 @@ a.tag:hover, .tag.current { background: var(--btn); color: var(--on-btn); }
 .more[open] > summary::after { content: "–"; }
 .more form { display: grid; gap: var(--space-4); padding: 0 var(--card-pad) var(--card-pad); }
 
+/* ---------- Страница ошибки ---------- */
+.error-page { display: grid; justify-items: center; gap: var(--space-4); text-align: center; padding: var(--space-16) 0; }
+
 /* ---------- Подвал ---------- */
 .foot { max-width: 960px; margin: 0 auto; padding: 0 var(--space-4) var(--space-8); color: var(--muted); font-size: var(--fs-sm); text-align: center; }
 

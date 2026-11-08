@@ -21,10 +21,12 @@ from pathlib import Path
 import markdown as md
 import nh3
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 
 from .config import Settings
@@ -266,6 +268,34 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         elif "cache-control" not in resp.headers:
             resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    ERROR_TITLES = {400: "Неверный запрос", 403: "Доступ запрещён", 404: "Не найдено", 405: "Так нельзя",
+                    413: "Слишком большой файл", 422: "Неверные данные", 500: "Что-то пошло не так"}
+
+    def wants_html(request: Request) -> bool:
+        return "text/html" in request.headers.get("accept", "")
+
+    def error_page(request: Request, status: int, detail: str, headers=None):
+        if not wants_html(request):
+            return JSONResponse({"detail": detail}, status_code=status, headers=headers)
+        return templates.TemplateResponse(request, "error.html", {
+            "status": status, "title": ERROR_TITLES.get(status, "Ошибка"), "detail": detail,
+        }, status_code=status, headers=headers)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException):
+        detail = exc.detail if isinstance(exc.detail, str) else "Ошибка"
+        detail = {"Not Found": "Такой страницы нет.", "Method Not Allowed": "Такое действие здесь недоступно."}.get(detail, detail)
+        return error_page(request, exc.status_code, detail, getattr(exc, "headers", None))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        return error_page(request, 422, "Форма заполнена неверно — вернитесь и попробуйте ещё раз.")
+
+    @app.exception_handler(Exception)
+    async def server_error(request: Request, exc: Exception):
+        log.exception("Необработанная ошибка на %s", request.url.path)
+        return error_page(request, 500, "Ошибка на сервере. Подробности — в журнале (docker compose logs).")
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     # Добавляется последним, значит срабатывает первым: до разбора формы и записи файлов.

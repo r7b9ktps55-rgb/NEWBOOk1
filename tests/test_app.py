@@ -1131,3 +1131,25 @@ def test_human_when():
     assert human_when((now - timedelta(days=1)).strftime("%Y-%m-%d") + " 23:59", tz) == "вчера в 23:59"
     assert human_when("2020-03-06 07:00", tz) == "6 марта 2020 в 07:00"
     assert human_when(None, tz) == "" and human_when("непонятно", tz) == "непонятно"
+
+
+
+def test_error_pages_are_styled_for_browsers(tmp_path):
+    client, _, _ = make(tmp_path)
+    html = client.get("/notes/nope.md", auth=AUTH, headers={"Accept": "text/html"})
+    assert html.status_code == 404 and "Заметка не найдена" in html.text and 'class="error-page"' in html.text
+    assert client.get("/notes/nope.md", auth=AUTH).json() == {"detail": "Заметка не найдена"}  # скриптам — JSON
+    missing = client.get("/no-such-page", auth=AUTH, headers={"Accept": "text/html"})
+    assert missing.status_code == 404 and "Такой страницы нет" in missing.text
+    bad = client.post("/jobs/abc/retry", auth=AUTH, headers={"Accept": "text/html"})
+    assert bad.status_code == 422 and "Форма заполнена неверно" in bad.text
+
+
+
+def test_server_error_page(tmp_path, monkeypatch):
+    s = Settings(web_password="secret-pass-42", data_dir=tmp_path / "data")
+    app = create_app(s, start_scheduler=False)
+    client = TestClient(app, raise_server_exceptions=False)
+    monkeypatch.setattr(app.state.store, "list", lambda *a: 1 / 0)
+    r = client.get("/", auth=AUTH, headers={"Accept": "text/html"})
+    assert r.status_code == 500 and "Ошибка на сервере" in r.text and "ZeroDivisionError" not in r.text
