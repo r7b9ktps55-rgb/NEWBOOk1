@@ -18,3 +18,14 @@
 {% else %}
 <div class="empty">{{ icon("book") }}<b>Здесь появятся заметки</b><span>Первая книга будет готова после разбора очереди.</span></div>
 {% endif %}
+{% if books or trash_count %}
+<div class="library-foot">
+  {% if books %}<a class="btn ghost small" href="/export.zip">{{ icon("download") }}Все заметки (.zip)</a>{% endif %}
+  {% if trash_count %}
+  <form action="/trash/empty" method="post" data-confirm="Удалить навсегда всё из корзины ({{ trash_count }})?">
+    <button class="btn ghost small">{{ icon("trash") }}Очистить корзину ({{ trash_count }})</button>
+  </form>
+  <span class="hint">Корзина очищается сама через {{ s.trash_days }} дн.</span>
+  {% endif %}
+</div>
+{% endif %}

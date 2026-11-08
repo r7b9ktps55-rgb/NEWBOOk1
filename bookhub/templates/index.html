@@ -10,9 +10,13 @@
 </div>
 {% endblock %}
 {% block content %}
-{% if message %}<p class="flash {{ message_kind }}" role="status" data-flash="{{ message_kind }}">{{ message }}</p>{% endif %}
+{% if message %}
+<div class="flash {{ message_kind }}" role="status" data-flash="{{ message_kind }}">
+  <span>{{ message }}</span>
+  {% if undo %}<form action="/trash/{{ undo }}/restore" method="post"><button class="btn small ghost">Отменить</button></form>{% endif %}
+</div>
+{% endif %}
 {% if not has_key %}<p class="flash warn">Не задан <code>GEMINI_API_KEY</code> — добавьте его в <code>.env</code> и перезапустите.</p>{% endif %}
-{% if git.last_error %}<p class="flash warn">Git: {{ git.last_error }}</p>{% endif %}
 
 <section class="hero {% if books %}hero-compact{% endif %}" aria-labelledby="hero-title">
   <h1 class="display" id="hero-title">Книги — в&nbsp;<mark class="marker" data-draw>заметки для&nbsp;Obsidian</mark></h1>

@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import json
 import logging
+import os
 import re
 import secrets
+import shutil
 import urllib.parse
+import uuid
+import zipfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import markdown as md
 import nh3
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -26,8 +33,10 @@ from .formats import FORMATS, parse_formats
 from .gitsync import GitSync
 from .guard import GuardMiddleware, LoginLimiter
 from .library import find_book, library, parse_meta
+from .notify import Notifier
 from .store import JobStore
 from .summarizer import GeminiSummarizer, Summarizer, safe_filename
+from .trash import Trash
 from .worker import Processor
 
 log = logging.getLogger("bookhub")
@@ -47,7 +56,9 @@ MESSAGES = {
     "nokey": ("Не задан GEMINI_API_KEY — конспекты делать нечем", "warn"),
     "empty": ("Очередь пуста", "warn"),
     "retry": ("Задача снова в очереди", "ok"),
-    "deleted": ("Удалено", "ok"),
+    "deleted": ("Удалено — файл лежит в корзине", "ok"),
+    "restored": ("Восстановлено из корзины", "ok"),
+    "trash_emptied": ("Корзина очищена", "ok"),
 }
 
 # Подписи полей frontmatter на странице заметки (title, author, book и format показываются в заголовке)
@@ -120,34 +131,95 @@ def static_version(folder: Path) -> str:
     return h.hexdigest()[:10]
 
 
+class _HideHealthChecks(logging.Filter):
+    """Проверка здоровья раз в 30 секунд не должна засорять журнал."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health" not in record.getMessage()
+
+
+def setup_logging(s: Settings) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    tz = s.tz
+    logging.Formatter.converter = lambda ts: datetime.fromtimestamp(ts, tz).timetuple()  # время журнала — местное
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _HideHealthChecks) for f in access.filters):
+        access.addFilter(_HideHealthChecks())
+
+
+def acquire_scheduler_lock(s: Settings):
+    """Расписание должно работать в одном процессе, даже если запущено несколько копий приложения."""
+    try:
+        import fcntl
+    except ImportError:  # Windows: блокировки нет, полагаемся на один процесс
+        return True
+    handle = open(s.data_dir / ".scheduler.lock", "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except OSError:
+        handle.close()
+        return None
+
+
 def create_app(settings: Settings | None = None, summarizer: Summarizer | None = None,
                start_scheduler: bool = True) -> FastAPI:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     s = settings or Settings.from_env()
     s.validate()
+    setup_logging(s)
     s.ensure_dirs()
 
     if summarizer is None and s.gemini_api_key:
         summarizer = GeminiSummarizer(s.gemini_api_key, s.gemini_model, s.data_dir)
     store = JobStore(s.db_path)
-    git = GitSync(s)
-    proc = Processor(s, store, summarizer, git)
+    notifier = Notifier(s.notify_url)
+    trash = Trash(s)
+    git = GitSync(s, store)
+    proc = Processor(s, store, summarizer, git, notifier, trash)
+    if isinstance(summarizer, GeminiSummarizer):
+        summarizer.max_requests = s.max_requests_per_job
+        summarizer.meter = proc.take_request
     tasks: set[asyncio.Task] = set()
+
+    def missed_daily_run() -> bool:
+        """Сервер был выключен в назначенное время, а разбор уже когда-то работал — догоняем."""
+        hm = s.daily_time()
+        raw = store.get_meta("last_daily_run")
+        if not hm or not raw:
+            return False
+        now = datetime.now(s.tz)
+        last = json.loads(raw).get("at", "")[:10]
+        return now >= now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0) and last < now.strftime("%Y-%m-%d")
+
+    async def maintenance_job() -> None:
+        await asyncio.to_thread(proc.maintenance)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         sched = None
-        hm = s.daily_time()
-        if start_scheduler and hm:
+        lock = acquire_scheduler_lock(s) if start_scheduler else None
+        if lock:
             from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-            sched = AsyncIOScheduler(timezone=s.timezone)
-            sched.add_job(proc.run, "cron", hour=hm[0], minute=hm[1], kwargs={"limit": s.daily_batch_size})
+            # coalesce + misfire_grace_time: если машина спала в назначенное время, задача выполнится после пробуждения.
+            sched = AsyncIOScheduler(timezone=s.timezone, job_defaults={"coalesce": True, "misfire_grace_time": 6 * 3600})
+            hm, bt = s.daily_time(), s.backup_at()
+            if hm:
+                sched.add_job(proc.daily, "cron", hour=hm[0], minute=hm[1], id="daily")
+                log.info("Ежедневный разбор: %s (%s), по %d шт.", s.daily_run_time, s.timezone, s.daily_batch_size)
+            if bt:
+                sched.add_job(maintenance_job, "cron", hour=bt[0], minute=bt[1], id="maintenance")
             sched.start()
-            log.info("Ежедневный разбор: %s (%s), по %d шт.", s.daily_run_time, s.timezone, s.daily_batch_size)
+            if missed_daily_run():
+                log.info("Ежедневный разбор был пропущен — запущу его через минуту")
+                sched.add_job(proc.daily, "date", run_date=datetime.now(s.tz) + timedelta(minutes=1), id="catch-up")
+        elif start_scheduler:
+            log.warning("Расписание уже работает в другом процессе приложения — здесь оно выключено")
         yield
         if sched:
             sched.shutdown(wait=False)
+        if lock and lock is not True:
+            lock.close()
         for t in tasks:
             t.cancel()
 
@@ -188,8 +260,9 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
                 raise HTTPException(403, "Запрос с чужого сайта")
         return c.username
 
-    def back(msg: str) -> RedirectResponse:
-        return RedirectResponse(f"/?m={msg}", status_code=303)
+    def back(msg: str, **extra: str) -> RedirectResponse:
+        query = urllib.parse.urlencode({"m": msg, **extra})
+        return RedirectResponse(f"/?{query}", status_code=303)
 
     def note_path(name: str) -> Path:
         base = s.books_dir.resolve()
@@ -213,9 +286,24 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         t.add_done_callback(tasks.discard)
         return "started"
 
+    def health_checks() -> dict[str, bool]:
+        checks = {}
+        try:
+            store.get_meta("health")
+            checks["db"] = True
+        except Exception:
+            checks["db"] = False
+        checks["disk"] = shutil.disk_usage(s.data_dir).free > 200 * 1024 * 1024
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(timespec="seconds")
+        checks["queue"] = not any(j.updated_at < stale for j in store.list("processing")) if checks["db"] else False
+        return checks
+
     @app.get("/health")
     async def health():
-        return JSONResponse({"ok": True})
+        """Для Docker: 503, если база недоступна, диск почти заполнен или задача зависла."""
+        checks = await asyncio.to_thread(health_checks)
+        ok = all(checks.values())
+        return JSONResponse({"ok": ok, **checks}, status_code=200 if ok else 503)
 
     def page_state() -> dict:
         """Всё, что нужно очереди и библиотеке; version меняется при любом изменении."""
@@ -224,23 +312,32 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         books = library(s.books_dir)
         busy = proc.busy or any(j.status == "processing" for j in jobs)
         queue_sig = repr([(j.id, j.status, j.progress, j.done_formats, j.error) for j in active]) + repr(busy)
-        lib_sig = repr([(b.name, [n.name for n in b.notes], round(b.mtime, 3)) for b in books])
+        trash_count = len(trash.items())
+        lib_sig = repr([(b.name, [n.name for n in b.notes], round(b.mtime, 3)) for b in books]) + f"|{trash_count}"
         lib_version = hashlib.sha1(lib_sig.encode()).hexdigest()[:12]
+        today_requests = store.requests_on(proc.today())
+        last_daily = json.loads(store.get_meta("last_daily_run") or "null")
         return {
             "s": s,
             "git": git,
             "formats": FORMATS,
             "has_key": summarizer is not None,
+            "requests_today": today_requests,
+            "limit_reached": bool(s.daily_request_limit) and today_requests >= s.daily_request_limit,
+            "last_daily": last_daily,
+            "trash_count": trash_count,
+            "notifications": notifier.enabled,
             "active": active,
             "books": books,
             "busy": busy,
             "notes_total": sum(len(b.notes) for b in books),
             "lib_version": lib_version,
-            "version": hashlib.sha1((queue_sig + lib_version + str(git.last_error)).encode()).hexdigest()[:12],
+            "version": hashlib.sha1((queue_sig + lib_version + str(git.last_error) + str(today_requests)
+                                     + str(last_daily)).encode()).hexdigest()[:12],
         }
 
     @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request, m: str = "", _: str = Depends(auth)):
+    async def index(request: Request, m: str = "", undo: str = "", _: str = Depends(auth)):
         await asyncio.to_thread(proc.sync_inbox)
         state = await asyncio.to_thread(page_state)
         text, kind = MESSAGES.get(m, ("", ""))
@@ -249,6 +346,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             **state,
             "message": text,
             "message_kind": kind,
+            "undo": undo if m == "deleted" and re.fullmatch(r"[0-9]{14}-[0-9a-f]{6}", undo) else "",
             "checked": s.default_formats,
             "file_types": sorted(set(types), key=types.index),
             "file_exts": list(FILE_TYPES),
@@ -273,18 +371,14 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             "library": library_html,
         })
 
-    async def save_file(f: UploadFile) -> Path | None:
+    async def save_file(f: UploadFile, picked: list[str]) -> Path | None:
         """Сохраняет книгу в inbox. None — если формат не поддерживается, файл битый или больше лимита."""
         limit = s.max_upload_mb * 1024 * 1024
         raw_stem, ext = split_name(Path(f.filename or "").name)
         if not ext:
             return None
-        stem = safe_filename(raw_stem, "book")
-        # Имя не должно совпасть ни с файлом в inbox, ни с уже обработанной книгой.
-        dest, n = s.inbox / f"{stem}{ext}", 2
-        while dest.exists() or store.has_file(dest.name):
-            dest, n = s.inbox / f"{stem} ({n}){ext}", n + 1
-        tmp = s.inbox / f".{dest.name}.part"
+        # Сначала пишем во временный файл с уникальным именем: две одновременные загрузки не столкнутся.
+        tmp = s.uploads_tmp / f"{uuid.uuid4().hex}.part"
         size, ok = 0, True
         with tmp.open("wb") as out:
             while chunk := await f.read(1024 * 1024):
@@ -296,11 +390,18 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
                     ok = False
                     break
                 out.write(chunk)
-        if ok and size:
-            tmp.rename(dest)
-            return dest
-        tmp.unlink(missing_ok=True)
-        return None
+        if not (ok and size):
+            tmp.unlink(missing_ok=True)
+            return None
+
+        def place() -> Path:
+            with proc.inbox_lock:  # имя выбирается и занимается атомарно (подхват inbox ждёт)
+                dest = proc.free_inbox_name(safe_filename(raw_stem, "book"), ext)
+                os.replace(tmp, dest)
+                store.add("file", dest.name, split_name(dest.name)[0], picked)
+                return dest
+
+        return await asyncio.to_thread(place)
 
     @app.post("/add")
     async def add(files: list[UploadFile] = File([]), url: str = Form(""), formats: list[str] = Form([]),
@@ -312,10 +413,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             return back("nothing")
         rejected = 0
         for f in files:
-            dest = await save_file(f)
-            if dest:
-                store.add("file", dest.name, split_name(dest.name)[0], picked)
-            else:
+            if not await save_file(f, picked):
                 rejected += 1
         if url:
             parts = urllib.parse.urlsplit(url)
@@ -336,9 +434,13 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     @app.post("/jobs/{job_id}/delete")
     async def delete(job_id: int, _: str = Depends(auth)):
         job = store.delete(job_id)
-        if job and job.is_file and job.status != "done":
-            (s.inbox / Path(job.source).name).unlink(missing_ok=True)
-        return back("deleted")
+        undo = ""
+        # Файл ещё не взятой в работу книги лежит в inbox — переносим его в корзину, а не стираем.
+        if job and job.is_file and job.status == "queued":
+            path = s.inbox / Path(job.source).name
+            if path.is_file():
+                undo = trash.put(path)
+        return back("deleted", undo=undo) if undo else back("deleted")
 
     @app.get("/notes/{name}", response_class=HTMLResponse)
     async def view_note(request: Request, name: str, _: str = Depends(auth)):
@@ -384,14 +486,47 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         path = note_path(name)
         return FileResponse(path, filename=path.name, media_type="text/markdown; charset=utf-8")
 
-    @app.post("/notes/{name}/delete")
-    async def delete_note(name: str, _: str = Depends(auth)):
-        note_path(name).unlink()
+    def sync_later(message: str) -> None:
         if git.enabled:
-            t = asyncio.create_task(asyncio.to_thread(git.sync, f"Remove {Path(name).stem}"))
+            t = asyncio.create_task(asyncio.to_thread(git.sync, message))
             tasks.add(t)
             t.add_done_callback(tasks.discard)
-        return back("deleted")
+
+    @app.post("/notes/{name}/delete")
+    async def delete_note(name: str, _: str = Depends(auth)):
+        item = trash.put(note_path(name))
+        sync_later(f"Remove {Path(name).stem}")
+        return back("deleted", undo=item)
+
+    @app.post("/trash/{item_id}/restore")
+    async def restore(item_id: str, _: str = Depends(auth)):
+        restored = await asyncio.to_thread(trash.restore, item_id)
+        if not restored:
+            raise HTTPException(404, "В корзине такого нет")
+        if restored.parent == s.books_dir.resolve():
+            sync_later(f"Restore {restored.stem}")
+        return back("restored")
+
+    @app.post("/trash/empty")
+    async def empty_trash(_: str = Depends(auth)):
+        await asyncio.to_thread(trash.purge)
+        return back("trash_emptied")
+
+    @app.get("/export.zip")
+    async def export_notes(_: str = Depends(auth)):
+        """Все заметки одним архивом — например, чтобы перенести их в другое хранилище."""
+        def build() -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for p in sorted(s.books_dir.glob("*.md")):
+                    z.write(p, f"{s.vault_subfolder or 'Books'}/{p.name}")
+            return buf.getvalue()
+
+        data = await asyncio.to_thread(build)
+        stamp = datetime.now(s.tz).strftime("%Y-%m-%d")
+        return Response(data, media_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="bookhub-notes-{stamp}.zip"'})
 
     app.state.store, app.state.processor, app.state.git, app.state.limiter = store, proc, git, limiter
+    app.state.trash, app.state.notifier = trash, notifier
     return app

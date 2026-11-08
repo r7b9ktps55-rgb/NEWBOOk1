@@ -45,7 +45,7 @@ function setupReveal(root = document) {
 // ---------- Уведомления ----------
 const toastBox = document.querySelector("[data-toasts]");
 
-function toast(text, kind = "ok") {
+function toast(text, kind = "ok", action = null) {
   if (!toastBox) return;
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
@@ -53,18 +53,20 @@ function toast(text, kind = "ok") {
   const span = document.createElement("span");
   span.textContent = text;
   el.append(span);
+  if (action) el.append(action); // например, форма «Отменить»
   toastBox.append(el);
   if (!reduce) animate(el, { opacity: [0, 1], y: [16, 0], scale: [0.98, 1] }, { duration: 0.35, ease: EASE });
   setTimeout(async () => {
     if (!reduce) await animate(el, { opacity: 0, y: 8 }, { duration: 0.25, ease: "easeIn" });
     el.remove();
-  }, 4500);
+  }, action ? 9000 : 4500);
 }
 
 function flashToToast() {
   const flash = document.querySelector("[data-flash]");
   if (!flash) return;
-  toast(flash.textContent.trim(), flash.dataset.flash === "warn" ? "warn" : "ok");
+  const text = (flash.querySelector("span") || flash).textContent.trim();
+  toast(text, flash.dataset.flash === "warn" ? "warn" : "ok", flash.querySelector("form"));
   flash.remove();
   const url = new URL(location.href);
   url.searchParams.delete("m");

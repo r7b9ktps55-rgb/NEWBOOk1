@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from dotenv import load_dotenv
 
 from .formats import parse_formats
@@ -50,6 +52,18 @@ class Settings:
     max_upload_mb: int = 200
     # Какие форматы отмечены по умолчанию (и для PDF, положенных в inbox вручную)
     default_formats: tuple[str, ...] = ("summary",)
+    # Защита от лишних расходов: запросов к Gemini на одну книгу и за сутки (0 — без лимита)
+    max_requests_per_job: int = 60
+    daily_request_limit: int = 300
+    # Уведомления: ntfy.sh/свой топик, вебхук или ссылка с {text} (например, Telegram sendMessage)
+    notify_url: str = ""
+    # Резервные копии: куда, во сколько и сколько хранить
+    backup_dir: Path | None = None
+    backup_time: str = "03:30"
+    backup_keep: int = 7
+    backup_books: bool = False  # класть ли в копию исходные книги (archive, inbox) — они могут быть большими
+    # Удалённые заметки и книги лежат в корзине столько дней
+    trash_days: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -73,6 +87,14 @@ class Settings:
             git_author_email=env("GIT_AUTHOR_EMAIL", "bookhub@localhost") or "bookhub@localhost",
             max_upload_mb=_int("MAX_UPLOAD_MB", 200),
             default_formats=tuple(parse_formats(env("DEFAULT_FORMATS", "summary"))),
+            max_requests_per_job=_int("MAX_REQUESTS_PER_JOB", 60),
+            daily_request_limit=_int("DAILY_REQUEST_LIMIT", 300),
+            notify_url=env("NOTIFY_URL"),
+            backup_dir=Path(env("BACKUP_DIR")) if env("BACKUP_DIR") else None,
+            backup_time=env("BACKUP_TIME", "03:30"),
+            backup_keep=_int("BACKUP_KEEP", 7),
+            backup_books=env("BACKUP_BOOKS").lower() in ("1", "true", "yes", "да"),
+            trash_days=_int("TRASH_DAYS", 30),
         )
 
     def validate(self) -> None:
@@ -86,18 +108,37 @@ class Settings:
             raise ConfigError("OBSIDIAN_VAULT_SUBFOLDER должна быть относительной папкой внутри хранилища.")
         if self.daily_batch_size < 1:
             raise ConfigError("DAILY_BATCH_SIZE должно быть ≥ 1.")
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ConfigError(f"Неизвестный часовой пояс TIMEZONE={self.timezone!r}. Пример: Europe/Moscow") from None
+        if self.backup_time not in ("", "off") and self.parse_time(self.backup_time) is None:
+            raise ConfigError(f"BACKUP_TIME должно быть в формате ЧЧ:ММ, сейчас: {self.backup_time!r}")
+        if min(self.max_requests_per_job, self.daily_request_limit, self.backup_keep, self.trash_days) < 0:
+            raise ConfigError("Лимиты и сроки хранения не могут быть отрицательными.")
 
     @property
     def max_request_bytes(self) -> int:
         """Лимит одного запроса: до пяти книг максимального размера за раз."""
         return (self.max_upload_mb * 5 + 1) * 1024 * 1024
 
-    def daily_time(self) -> tuple[int, int] | None:
-        m = re.fullmatch(r"(\d{1,2}):(\d{2})", self.daily_run_time)
+    @staticmethod
+    def parse_time(value: str) -> tuple[int, int] | None:
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", value)
         if not m:
             return None
         h, mi = int(m.group(1)), int(m.group(2))
         return (h, mi) if h < 24 and mi < 60 else None
+
+    def daily_time(self) -> tuple[int, int] | None:
+        return self.parse_time(self.daily_run_time)
+
+    def backup_at(self) -> tuple[int, int] | None:
+        return self.parse_time(self.backup_time)
+
+    @property
+    def tz(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
 
     # Папки внутри data/
     @property
@@ -120,6 +161,31 @@ class Settings:
     def db_path(self) -> Path:
         return self.data_dir / "bookhub.db"
 
+    @property
+    def trash(self) -> Path:
+        return self.data_dir / "trash"
+
+    @property
+    def cache(self) -> Path:
+        return self.data_dir / "cache"
+
+    @property
+    def uploads_tmp(self) -> Path:
+        return self.data_dir / "tmp"
+
+    @property
+    def backups(self) -> Path:
+        return self.backup_dir or self.data_dir / "backups"
+
     def ensure_dirs(self) -> None:
-        for d in (self.inbox, self.archive, self.books_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        try:
+            for d in (self.inbox, self.archive, self.books_dir, self.trash, self.uploads_tmp):
+                d.mkdir(parents=True, exist_ok=True)
+            probe = self.data_dir / ".write-test"
+            probe.write_text("ok")
+            probe.unlink()
+        except PermissionError:
+            raise ConfigError(
+                f"Нет прав на запись в папку данных {self.data_dir.resolve()}. "
+                "В Docker выполните на сервере: sudo chown -R 1000:1000 data"
+            ) from None

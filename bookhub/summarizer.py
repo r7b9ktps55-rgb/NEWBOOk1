@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
@@ -24,12 +25,18 @@ CHUNK_MAX_PAGES = 30
 SCAN_WORDS_PER_PAGE = 300  # оценка для сканов, где текст не извлекается
 INLINE_LIMIT = 18 * 1024 * 1024
 RETRY_DELAYS = (15, 45, 90)
+GEMINI_TIMEOUT_MS = 10 * 60 * 1000  # зависший запрос не должен держать очередь вечно
+MAX_NAME_BYTES = 180  # файловые системы допускают 255 байт на имя; оставляем место для суффиксов
 
 Progress = Callable[[str], None]
 
 
 class SummaryError(Exception):
     pass
+
+
+class DailyLimitReached(SummaryError):
+    """Дневной лимит запросов к Gemini исчерпан — задача вернётся в очередь."""
 
 
 @dataclass
@@ -55,12 +62,20 @@ class Summarizer(Protocol):
 
 
 _BAD_CHARS = re.compile(r'[\\/*?:"<>|\x00-\x1f#^\[\]]')
+_BIDI = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 
 
 def safe_filename(name: str, fallback: str = "Без названия", limit: int = 100) -> str:
-    """Имя файла, безопасное для диска и для Obsidian (без / \\ : # [ ] и т.п.)."""
-    cleaned = _BAD_CHARS.sub("", name).strip().strip(".").strip()
+    """Имя файла, безопасное для диска и для Obsidian (без / \\ : # [ ] и т.п.).
+
+    Буквы приводятся к одной форме (NFC: имя с Mac и с Windows совпадёт), управляющие символы
+    направления текста убираются, длина ограничена и в символах, и в байтах."""
+    name = unicodedata.normalize("NFC", name)
+    cleaned = _BIDI.sub("", _BAD_CHARS.sub("", name)).strip().strip(".").strip()
     cleaned = re.sub(r"\s+", " ", cleaned)[:limit].strip()
+    while len(cleaned.encode()) > MAX_NAME_BYTES:
+        cleaned = cleaned[:-1]
+    cleaned = cleaned.strip().strip(".").strip()
     return cleaned or fallback
 
 
@@ -129,17 +144,30 @@ def page_groups(words: list[int], chunk_words: int = CHUNK_WORDS, max_pages: int
     return groups
 
 
+@dataclass
+class PdfLayout:
+    """Разбиение PDF на части для сжатия: считается один раз, без запросов к Gemini."""
+    reader: object
+    words: list[int]
+    groups: list[tuple[int, int]]
+
+
 class GeminiSummarizer:
     def __init__(self, api_key: str, model: str, prompts_dir: Path | None = None,
-                 client_factory: Callable | None = None, sleep: Callable[[float], None] = time.sleep):
+                 client_factory: Callable | None = None, sleep: Callable[[float], None] = time.sleep,
+                 max_requests: int = 60, meter: Callable[[], None] | None = None):
         if client_factory is None:
             from google import genai
+            from google.genai import types
 
-            client_factory = genai.Client
-        self.client = client_factory(api_key=api_key)
+            self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
+        else:
+            self.client = client_factory(api_key=api_key)
         self.model = model
         self.prompts_dir = prompts_dir
         self.sleep = sleep
+        self.max_requests = max_requests  # потолок запросов на одну книгу (0 — без потолка)
+        self.meter = meter  # вызывается перед каждым запросом; бросает DailyLimitReached
 
     # ----- промпты -----
     def prompt(self, fmt: str) -> str:
@@ -152,6 +180,8 @@ class GeminiSummarizer:
 
     # ----- вызовы Gemini -----
     def _generate(self, contents: list) -> str:
+        if self.meter:
+            self.meter()
         for attempt in range(len(RETRY_DELAYS) + 1):
             try:
                 res = self.client.models.generate_content(model=self.model, contents=contents)
@@ -218,6 +248,16 @@ class GeminiSummarizer:
             material = "\n".join(x for x in (f"Книга (файл {Path(source).name}).", book_file.hint) if x)
             material += "\n\n" + text[:MAX_BOOK_TEXT]
 
+        # Сначала считаем, сколько запросов понадобится, и только потом тратим деньги.
+        layout = self._pdf_layout(Path(source), progress) if is_pdf and squeeze else None
+        parts = len(layout.groups) if layout else (len(split_text(text)) if squeeze else 0)
+        planned = len(whole) + parts * len(squeeze)
+        if self.max_requests and planned > self.max_requests:
+            raise SummaryError(
+                f"Для этой книги нужно {planned} запросов к Gemini — больше лимита {self.max_requests} "
+                "на одну книгу (MAX_REQUESTS_PER_JOB). Уберите сжатие или увеличьте лимит."
+            )
+
         if whole:
             up = None
             if is_pdf:
@@ -235,8 +275,8 @@ class GeminiSummarizer:
                     self._forget(up)
 
         for fmt in squeeze:
-            if is_pdf:
-                summary = self._compress_pdf(Path(source), fmt, book, fallback, progress)
+            if layout:
+                summary = self._compress_pdf(layout, fmt, book, fallback, progress)
             else:
                 summary = self._compress_text(text, fmt, book, fallback, progress)
             book = summary.book
@@ -272,8 +312,8 @@ class GeminiSummarizer:
         return Summary(fmt, book or safe_filename(fallback), intro + "\n\n" + "\n\n".join(out) + "\n",
                        {"source_words": source_words, "words": result_words})
 
-    def _compress_pdf(self, path: Path, fmt: str, book: str | None, fallback: str, progress: Progress) -> Summary:
-        from pypdf import PdfReader, PdfWriter
+    def _pdf_layout(self, path: Path, progress: Progress) -> PdfLayout:
+        from pypdf import PdfReader
 
         progress("читаю PDF")
         reader = PdfReader(path)
@@ -285,16 +325,23 @@ class GeminiSummarizer:
                 words.append(0)
         if sum(words) < 50 * max(1, len(words)):  # скан без текстового слоя
             words = [SCAN_WORDS_PER_PAGE] * len(words)
+        groups = page_groups(words)
+        if not groups:
+            raise SummaryError("В PDF нет страниц")
+        return PdfLayout(reader, words, groups)
+
+    def _compress_pdf(self, layout: PdfLayout, fmt: str, book: str | None, fallback: str,
+                      progress: Progress) -> Summary:
+        from pypdf import PdfWriter
+
         parts = []
-        for a, b in page_groups(words):
+        for a, b in layout.groups:
             writer = PdfWriter()
-            for page in reader.pages[a:b]:
+            for page in layout.reader.pages[a:b]:
                 writer.add_page(page)
             buf = io.BytesIO()
             writer.write(buf)
-            parts.append((buf.getvalue(), sum(words[a:b])))
-        if not parts:
-            raise SummaryError("В PDF нет страниц")
+            parts.append((buf.getvalue(), sum(layout.words[a:b])))
         return self._compress(parts, fmt, book, fallback, progress)
 
     def _compress_text(self, text: str, fmt: str, book: str | None, fallback: str, progress: Progress) -> Summary:

@@ -1,4 +1,5 @@
 import asyncio
+import urllib.parse
 import io
 import sqlite3
 import subprocess
@@ -75,7 +76,7 @@ def test_auth(tmp_path):
     r = client.get("/", auth=AUTH)
     assert r.status_code == 200 and "Book Hub" in r.text and "Сжатие ×3" in r.text
     assert "default-src 'self'" in r.headers["content-security-policy"]
-    assert client.get("/health").json() == {"ok": True}
+    assert client.get("/health").json() == {"ok": True, "db": True, "disk": True, "queue": True}
 
 
 def test_upload_process_and_view(tmp_path):
@@ -798,3 +799,291 @@ def test_books_folder_recreated_after_git_removes_it(tmp_path):
     assert s.books_dir.is_dir()
     upload(client, "b.pdf")
     assert run_queue(app) == 1
+
+
+# ---------- расходы, уведомления, надёжность ----------
+
+def test_request_cap_stops_before_spending(tmp_path):
+    pdf = tmp_path / "b.pdf"
+    blank_pdf(pdf, 45)  # 3 части для сжатия
+    holder = {}
+
+    def factory(api_key):
+        holder["c"] = FakeClient(api_key)
+        return holder["c"]
+
+    g = GeminiSummarizer("k", "m", tmp_path, client_factory=factory, sleep=lambda s: None, max_requests=3)
+    with pytest.raises(Exception, match="нужно 4 запроса|нужно 4 запросов"):
+        list(g.run("pdf", pdf, ["summary", "x3"], None, lambda t: None))
+    assert holder["c"].requests == [] and holder["c"].uploads == []  # ни одного платного запроса
+
+
+def test_daily_limit_requeues_and_stops(tmp_path):
+    from bookhub.summarizer import DailyLimitReached
+    client, s, app = make(tmp_path, FakeSummarizer(), daily_request_limit=2)
+    proc = app.state.processor
+    proc.take_request()
+    proc.take_request()
+    with pytest.raises(DailyLimitReached):
+        proc.take_request()
+
+    class LimitedFake(FakeSummarizer):
+        def run(self, kind, source, formats, book, progress):
+            yield from super().run(kind, source, formats[:1], book, progress)
+            raise DailyLimitReached("Дневной лимит запросов к Gemini исчерпан")
+
+    proc.summarizer = LimitedFake()
+    sent = []
+    app.state.notifier.url, app.state.notifier.background = "https://ntfy.example/t", False
+    app.state.notifier.opener = lambda req, timeout: sent.append(req) or io.BytesIO(b"ok")
+    upload(client, "a.pdf", formats=["summary", "quotes"])
+    upload(client, "b.pdf")
+    assert run_queue(app) == 1  # одна заметка готова, потом лимит — вторая книга не трогается
+    jobs = app.state.store.list()
+    assert [j.status for j in jobs] == ["queued", "queued"] and jobs[0].done_list == ["summary"]
+    assert len(sent) == 1 and "лимит" in urllib.parse.unquote(sent[0].data.decode())
+    assert 'Дневной лимит запросов' in client.get("/", auth=AUTH).text
+
+
+def test_error_notification_and_ntfy_format(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer(fail=True))
+    sent = []
+    n = app.state.notifier
+    n.url, n.background = "https://ntfy.sh/my-topic", False
+    n.opener = lambda req, timeout: sent.append(req) or io.BytesIO(b"ok")
+    upload(client, "a.pdf")
+    run_queue(app)
+    req = sent[0]
+    assert req.get_method() == "POST" and req.full_url == "https://ntfy.sh/my-topic"
+    assert "не удалось обработать «a»" in req.data.decode() and "модель недоступна" in req.data.decode()
+    # ссылка с {text} — GET, текст подставляется в адрес
+    from bookhub.notify import Notifier, mask_url
+    got = []
+    tg = Notifier("https://api.telegram.org/bot123:ABC/sendMessage?chat_id=1&text={text}",
+                  opener=lambda req, timeout: got.append(req) or io.BytesIO(b"ok"), background=False)
+    tg.send("готово 1")
+    assert got[0].get_method() == "GET" and "text=Book%20Hub%3A%20" in got[0].full_url
+    assert "123:ABC" not in mask_url(tg.url)
+
+
+def test_trash_undo_and_purge(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf")
+    run_queue(app)
+    r = client.post("/notes/a - Автор.md/delete", auth=AUTH, follow_redirects=False)
+    assert r.status_code == 303 and "undo=" in r.headers["location"]
+    assert not (s.books_dir / "a - Автор.md").exists()
+    page = client.get(r.headers["location"], auth=AUTH).text
+    item = urllib.parse.parse_qs(urllib.parse.urlsplit(r.headers["location"]).query)["undo"][0]
+    assert f'action="/trash/{item}/restore"' in page
+    assert client.post(f"/trash/{item}/restore", auth=AUTH, follow_redirects=False).headers["location"] == "/?m=restored"
+    assert (s.books_dir / "a - Автор.md").exists()
+    assert client.post("/trash/../../etc/restore", auth=AUTH).status_code == 404
+    # удалённый из очереди файл тоже в корзине, а не стёрт
+    upload(client, "b.pdf")
+    job = app.state.store.list("queued")[0]
+    client.post(f"/jobs/{job.id}/delete", auth=AUTH)
+    assert not (s.inbox / "b.pdf").exists() and len(app.state.trash.items()) == 1
+    assert app.state.trash.purge(older_than_days=30) == 0  # свежее не трогаем
+    client.post("/trash/empty", auth=AUTH)
+    assert app.state.trash.items() == []
+
+
+def test_export_zip(tmp_path):
+    import zipfile
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf", formats=["summary", "quotes"])
+    run_queue(app)
+    r = client.get("/export.zip", auth=AUTH)
+    assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
+    names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
+    assert sorted(names) == ["Books/a - Автор (цитаты).md", "Books/a - Автор.md"]
+
+
+def test_backup_and_restore_roundtrip(tmp_path):
+    from bookhub.backup import list_backups, make_backup, restore
+    client, s, app = make(tmp_path, FakeSummarizer(), backup_keep=2)
+    upload(client, "a.pdf")
+    run_queue(app)
+    upload(client, "b.pdf")  # в очереди
+    archive = make_backup(s, include_books=True)
+    assert archive.exists()
+    fresh = Settings(web_password="secret-pass-42", data_dir=tmp_path / "restored")
+    restore(fresh, archive)
+    for _ in range(3):
+        make_backup(s)
+    assert len(list_backups(s)) == 2  # хранится не больше BACKUP_KEEP
+    client2 = TestClient(create_app(fresh, summarizer=FakeSummarizer(), start_scheduler=False))
+    home = client2.get("/", auth=AUTH).text
+    assert 'data-title="a - автор"' in home and 'data-job="2"' in home
+    assert (fresh.archive / "a.pdf").exists() and (fresh.inbox / "b.pdf").exists()
+    with pytest.raises(ConfigError, match="--force"):
+        restore(fresh, list_backups(s)[0])
+
+
+def test_maintenance(tmp_path):
+    import os
+    client, s, app = make(tmp_path, FakeSummarizer())
+    s.cache.mkdir(parents=True, exist_ok=True)
+    (s.cache / "gone.djvu.pdf").write_bytes(PDF)  # книги уже нет в архиве
+    old = app.state.trash.put((s.inbox / "x.txt").write_text("x") and s.inbox / "x.txt")
+    os.utime(s.trash / old, (0, 0))
+    report = app.state.processor.maintenance()
+    assert report["backup"].startswith("bookhub-") and report["trash_purged"] == 1 and report["cache_purged"] == 1
+
+
+def test_health_reports_problems(tmp_path, monkeypatch):
+    client, s, app = make(tmp_path)
+
+    def broken(key):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(app.state.store, "get_meta", broken)
+    r = client.get("/health")
+    assert r.status_code == 503 and r.json()["db"] is False
+
+
+def test_inbox_name_collision_is_renamed(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "x.pdf")
+    run_queue(app)  # x.pdf теперь в архиве, задача готова
+    (s.inbox / "x.pdf").write_bytes(PDF)  # другую книгу с тем же именем положили вручную
+    app.state.processor.sync_inbox()
+    assert (s.inbox / "x (2).pdf").exists() and app.state.store.list("queued")[0].source == "x (2).pdf"
+
+
+def test_more_formats_uses_right_book_after_name_reuse(tmp_path):
+    fake = FakeSummarizer(fail=True)
+    client, s, app = make(tmp_path, fake)
+    upload(client, "a.pdf")
+    run_queue(app)  # упала, файл книги A уже в архиве как a.pdf
+    client.post(f"/jobs/{app.state.store.list()[0].id}/delete", auth=AUTH)
+    fake.fail = False
+    upload(client, "a.pdf")  # другая книга B с тем же именем
+    run_queue(app)
+    note = next(s.books_dir.glob("*.md"))
+    assert read_meta(note)["source"] == "a (2).pdf"  # не a.pdf — это файл книги A
+
+
+def test_same_title_different_files_are_different_books(tmp_path):
+    class SameName(FakeSummarizer):
+        def run(self, kind, source, formats, book, progress):
+            for fmt in formats:
+                yield Summary(fmt, book or "Неизвестно - Неизвестно", "текст\n")
+
+    client, s, app = make(tmp_path, SameName())
+    upload(client, "one.pdf")
+    upload(client, "two.pdf")
+    run_queue(app)
+    html = client.get("/", auth=AUTH).text
+    assert html.count('class="book-card') == 2
+
+
+def test_very_long_unicode_names(tmp_path):
+    class LongName(FakeSummarizer):
+        def run(self, kind, source, formats, book, progress):
+            for fmt in formats:
+                yield Summary(fmt, "書" * 120 + " - " + "😀" * 50, "текст\n")
+
+    client, s, app = make(tmp_path, LongName())
+    r = upload(client, "道" * 120 + ".pdf", formats=["summary", "x2"])
+    assert r.status_code == 303
+    assert run_queue(app) == 2
+    names = [p.name for p in s.books_dir.glob("*.md")]
+    assert len(names) == 2 and all(len(n.encode()) <= 255 for n in names)
+    assert any(n.endswith("(сжатие x2).md") for n in names)  # формат в имени не обрезан
+
+
+def test_safe_filename_normalizes_unicode():
+    import unicodedata
+    nfd = unicodedata.normalize("NFD", "Ёжик")
+    assert safe_filename(nfd) == "Ёжик"
+    assert safe_filename("abc‮dcba") == "abcdcba"
+
+
+def test_concurrent_uploads_with_same_name(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    client, s, app = make(tmp_path, FakeSummarizer())
+    big = PDF + b"0" * (3 * 1024 * 1024)
+    with ThreadPoolExecutor(4) as pool:
+        codes = list(pool.map(lambda _: upload(client, "same.pdf", big).status_code, range(4)))
+    assert codes == [303] * 4
+    assert sorted(p.name for p in s.inbox.iterdir()) == ["same (2).pdf", "same (3).pdf", "same (4).pdf", "same.pdf"]
+    assert len(app.state.store.list()) == 4
+
+
+def test_migration_is_atomic_and_backed_up(tmp_path, monkeypatch):
+    db = tmp_path / "old.db"
+    with sqlite3.connect(db) as c:
+        c.execute("""CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('pdf','url')),
+                     source TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', error TEXT, note TEXT,
+                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        for i in range(5):
+            c.execute("INSERT INTO jobs (kind, source, title, created_at, updated_at) VALUES ('pdf',?,?,'t','t')", (f"{i}.pdf", str(i)))
+        c.execute("DELETE FROM jobs WHERE id=5")  # последний номер 5 не должен выдаваться заново
+    real = JobStore._upgrade
+
+    def crash(self, c):
+        real(self, c)
+        raise RuntimeError("сбой посреди миграции")
+
+    monkeypatch.setattr(JobStore, "_upgrade", crash)
+    with pytest.raises(RuntimeError):
+        JobStore(db)
+    with sqlite3.connect(db) as c:  # база осталась в старом виде
+        assert c.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")} >= {"jobs"}
+        assert c.execute("SELECT count(*) FROM jobs").fetchone()[0] == 4
+    monkeypatch.setattr(JobStore, "_upgrade", real)
+    store = JobStore(db)
+    assert (tmp_path / "old.db.bak-v0").exists()
+    assert store.add("file", "new.epub", "n").id == 6
+    with sqlite3.connect(db) as c:
+        assert c.execute("PRAGMA user_version").fetchone()[0] == 3
+        idx = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"jobs_status", "jobs_source"} <= idx
+
+
+def test_claim_is_atomic_between_stores(tmp_path):
+    db = tmp_path / "q.db"
+    a, b = JobStore(db), JobStore(db)
+    a.add("file", "1.pdf", "1")
+    a.add("file", "2.pdf", "2")
+    first, second, third = a.claim_next(), b.claim_next(), a.claim_next()
+    assert {first.id, second.id} == {1, 2} and third is None
+
+
+def test_scheduler_lock_is_exclusive(tmp_path):
+    from bookhub.main import acquire_scheduler_lock
+    s = Settings(web_password="secret-pass-42", data_dir=tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    first = acquire_scheduler_lock(s)
+    assert first and acquire_scheduler_lock(s) is None
+    first.close()
+    assert acquire_scheduler_lock(s)
+
+
+def test_bad_timezone_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="часовой пояс"):
+        Settings(web_password="secret-pass-42", data_dir=tmp_path, timezone="Moscow").validate()
+
+
+def test_library_cache_sees_changes(tmp_path):
+    import os
+    from bookhub.library import library
+    d = tmp_path / "Books"
+    d.mkdir()
+    p = d / "n.md"
+    p.write_text('---\nbook: "A - B"\nformat: "summary"\n---\nx', "utf-8")
+    assert library(d)[0].notes[0].fmt == "summary"
+    p.write_text('---\nbook: "A - B"\nformat: "quotes"\n---\nxx', "utf-8")
+    os.utime(p, ns=(p.stat().st_atime_ns, p.stat().st_mtime_ns + 1_000_000))
+    assert library(d)[0].notes[0].fmt == "quotes"
+    p.unlink()
+    assert library(d) == []
+
+
+def test_long_frontmatter_is_read():
+    from bookhub.library import parse_meta
+    head = "---\n" + "".join(f"k{i}: {'x' * 100}\n" for i in range(60)) + 'book: "A - B"\n---\n'
+    assert parse_meta(head)["book"] == "A - B"

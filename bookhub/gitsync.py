@@ -23,12 +23,18 @@ class GitError(Exception):
 
 
 class GitSync:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, store=None):
         self.s = settings
         self.vault = settings.vault
         self._lock = threading.Lock()
-        self.last_error: str | None = None
-        self.last_sync: str | None = None
+        self.store = store  # если задан — состояние переживает перезапуск
+        self.last_error: str | None = store.get_meta("git_last_error") if store else None
+        self.last_sync: str | None = store.get_meta("git_last_sync") if store else None
+
+    def _remember(self) -> None:
+        if self.store:
+            self.store.set_meta("git_last_error", self.last_error)
+            self.store.set_meta("git_last_sync", self.last_sync)
 
     @property
     def enabled(self) -> bool:
@@ -110,10 +116,12 @@ class GitSync:
                 self._git("push", "origin", f"HEAD:{self.s.git_branch}")
                 self.last_error = None
                 self.last_sync = datetime.now(ZoneInfo(self.s.timezone)).strftime("%Y-%m-%d %H:%M")
+                self._remember()
                 return True
             except (GitError, OSError) as exc:
                 self.last_error = self._mask(str(exc))
                 log.error("Git: %s", self.last_error)
+                self._remember()
                 return False
             finally:
                 # git удаляет пустые папки — папка для заметок должна существовать всегда.
