@@ -1106,3 +1106,15 @@ def test_stale_local_copy_does_not_overwrite_vault_edits(tmp_path):
     show = subprocess.run(["git", "--git-dir", str(remote), "show", "main:Books/a.md"], capture_output=True, text=True).stdout
     assert show == "свежая правка из Obsidian" and (s.books_dir / "a.md").read_text("utf-8") == show
     assert "Books/n - Автор.md" in ls_remote(remote)
+
+
+
+def test_log_times_use_timezone(tmp_path):
+    import logging
+    import time as _time
+    from bookhub.main import setup_logging
+    setup_logging(Settings(web_password="secret-pass-42", data_dir=tmp_path, timezone="Asia/Tokyo"))
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "msg", None, None)
+    record.created = 0  # 1970-01-01 00:00 UTC = 09:00 в Токио
+    assert logging.Formatter("%(asctime)s").format(record).startswith("1970-01-01 09:00:00")
+    assert _time.localtime  # стандартный converter не сломан для других модулей

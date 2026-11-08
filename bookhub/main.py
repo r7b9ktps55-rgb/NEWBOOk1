@@ -141,7 +141,8 @@ class _HideHealthChecks(logging.Filter):
 def setup_logging(s: Settings) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     tz = s.tz
-    logging.Formatter.converter = lambda ts: datetime.fromtimestamp(ts, tz).timetuple()  # время журнала — местное
+    # Время в журнале — местное. staticmethod: иначе Python передаст функции ещё и сам форматтер.
+    logging.Formatter.converter = staticmethod(lambda ts: datetime.fromtimestamp(ts, tz).timetuple())
     access = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, _HideHealthChecks) for f in access.filters):
         access.addFilter(_HideHealthChecks())
