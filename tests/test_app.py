@@ -1087,3 +1087,22 @@ def test_long_frontmatter_is_read():
     from bookhub.library import parse_meta
     head = "---\n" + "".join(f"k{i}: {'x' * 100}\n" for i in range(60)) + 'book: "A - B"\n---\n'
     assert parse_meta(head)["book"] == "A - B"
+
+
+def test_stale_local_copy_does_not_overwrite_vault_edits(tmp_path):
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(remote), str(seed)], check=True, capture_output=True)
+    (seed / "Books").mkdir()
+    (seed / "Books" / "a.md").write_text("свежая правка из Obsidian", "utf-8")
+    for cmd in (["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed"], ["push", "origin", "HEAD:main"]):
+        subprocess.run(["git", *cmd], cwd=seed, check=True, capture_output=True)
+    client, s, app = make(tmp_path, FakeSummarizer(), git_repo_url=str(remote))
+    (s.books_dir / "a.md").write_text("старая копия из восстановленной папки", "utf-8")  # без .git
+    upload(client, "n.pdf")
+    run_queue(app)
+    assert app.state.git.last_error is None
+    show = subprocess.run(["git", "--git-dir", str(remote), "show", "main:Books/a.md"], capture_output=True, text=True).stdout
+    assert show == "свежая правка из Obsidian" and (s.books_dir / "a.md").read_text("utf-8") == show
+    assert "Books/n - Автор.md" in ls_remote(remote)
