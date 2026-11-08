@@ -321,6 +321,9 @@ main {
 .drop-files .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .drop-files .size { color: var(--muted); }
 .drop-files li.bad { background: var(--orange-wash); color: var(--orange-ink); border-color: transparent; }
+.upload-progress { display: grid; gap: 6px; font-size: var(--fs-sm); color: var(--pen-ink); font-weight: 600; }
+.upload-progress .track { height: 6px; border-radius: var(--radius); background: var(--pen-wash); overflow: hidden; }
+.upload-progress .fill { height: 100%; width: 100%; background: var(--pen); border-radius: var(--radius); transform-origin: left center; transform: scaleX(0); transition: transform .2s linear; }
 
 .or { display: flex; align-items: center; gap: var(--space-3); color: var(--muted); font-size: var(--fs-sm); }
 .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }

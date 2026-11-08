@@ -73,11 +73,54 @@ function flashToToast() {
   history.replaceState(null, "", url);
 }
 
+// ---------- Загрузка книг с полосой прогресса ----------
+function uploadWithProgress(form, submitter) {
+  const files = [...(form.querySelector("input[type=file]")?.files || [])];
+  const total = files.reduce((n, f) => n + f.size, 0);
+  const box = document.createElement("div");
+  box.className = "upload-progress";
+  box.setAttribute("role", "status");
+  box.innerHTML = '<span>Загружаю…</span><div class="track"><div class="fill"></div></div>';
+  (form.querySelector("[data-drop-list]") || form.firstElementChild).after(box);
+  const label = box.querySelector("span");
+  const fill = box.querySelector(".fill");
+  const buttons = [...form.querySelectorAll("button")];
+  buttons.forEach((b) => (b.disabled = true));
+  const fail = (text) => {
+    box.remove();
+    buttons.forEach((b) => (b.disabled = false));
+    submitter?.querySelector(".spinner")?.remove();
+    toast(text, "warn");
+  };
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", form.action);
+  xhr.upload.addEventListener("progress", (ev) => {
+    const loaded = ev.lengthComputable ? ev.loaded : 0;
+    const part = ev.lengthComputable && ev.total ? loaded / ev.total : 0;
+    fill.style.transform = `scaleX(${part})`;
+    label.textContent = part >= 1 ? "Файлы загружены, ставлю в очередь…"
+      : `Загружаю: ${humanSize(Math.min(loaded, total))} из ${humanSize(total)}`;
+  });
+  xhr.addEventListener("load", () => {
+    if (xhr.status < 400) location.assign(xhr.responseURL || "/");
+    else fail(xhr.status === 413 ? "Слишком большой файл или слишком много файлов за раз" : `Не удалось загрузить (ошибка ${xhr.status})`);
+  });
+  xhr.addEventListener("error", () => fail("Не удалось загрузить: нет связи с сервером"));
+  xhr.send(new FormData(form, submitter));
+}
+
 // ---------- Формы: подтверждение и защита от двойного нажатия ----------
 document.addEventListener("submit", (e) => {
   const form = e.target;
   if (form.dataset.confirm && !confirm(form.dataset.confirm)) {
     e.preventDefault();
+    return;
+  }
+  const fileInput = form.querySelector("input[type=file]");
+  if (fileInput?.files?.length && window.FormData && window.XMLHttpRequest) {
+    e.preventDefault();
+    e.submitter?.insertAdjacentHTML("afterbegin", '<span class="spinner" aria-hidden="true"></span>');
+    uploadWithProgress(form, e.submitter);
     return;
   }
   if (!form.matches("[data-busy-form]")) return;
@@ -203,6 +246,12 @@ function setupLive(root) {
   let active = Number(root.dataset.active || 0);
   let busy = root.dataset.busy === "1";
   let timer = 0;
+  const offline = document.querySelector("[data-offline]");
+  const setOffline = (on, text) => {
+    if (!offline) return;
+    if (text) offline.textContent = text;
+    offline.hidden = !on;
+  };
 
   const schedule = (ms) => {
     clearTimeout(timer);
@@ -216,7 +265,13 @@ function setupLive(root) {
         cache: "no-store",
         headers: { Accept: "application/json" },
       });
+      if (r.status === 401) {
+        setOffline(true, "Нужно войти заново — обновите страницу.");
+      } else if (!r.ok) {
+        setOffline(true, "Сервер ответил ошибкой — обновлю очередь, когда он придёт в себя.");
+      }
       if (r.ok) {
+        setOffline(false);
         const d = await r.json();
         if (d.version !== version) {
           const before = new Set([...queueBox.querySelectorAll("[data-job]")].map((el) => el.dataset.job));
@@ -248,7 +303,7 @@ function setupLive(root) {
         if (navCount) navCount.textContent = String(active);
       }
     } catch {
-      // нет связи — попробуем в следующий раз
+      setOffline(true, "Нет связи с сервером — обновлю очередь, когда связь вернётся.");
     }
     schedule();
   }

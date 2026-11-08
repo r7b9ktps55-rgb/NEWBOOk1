@@ -1153,3 +1153,15 @@ def test_server_error_page(tmp_path, monkeypatch):
     monkeypatch.setattr(app.state.store, "list", lambda *a: 1 / 0)
     r = client.get("/", auth=AUTH, headers={"Accept": "text/html"})
     assert r.status_code == 500 and "Ошибка на сервере" in r.text and "ZeroDivisionError" not in r.text
+
+
+
+def test_manifest_and_icons_are_public(tmp_path):
+    client, _, _ = make(tmp_path)
+    m = client.get("/static/manifest.webmanifest")
+    assert m.status_code == 200 and m.headers["content-type"].startswith("application/manifest+json")
+    assert m.json()["display"] == "standalone"
+    for icon in m.json()["icons"]:
+        r = client.get(icon["src"])
+        assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert 'rel="manifest"' in client.get("/", auth=AUTH).text

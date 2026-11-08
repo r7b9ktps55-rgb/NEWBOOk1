@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -42,6 +43,7 @@ from .trash import Trash
 from .worker import Processor
 
 log = logging.getLogger("bookhub")
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 HERE = Path(__file__).parent
 OBSIDIAN_URI_LIMIT = 60_000
 

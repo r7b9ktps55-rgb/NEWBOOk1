@@ -49,6 +49,7 @@
   </form>
 </section>
 
+<p class="flash warn" data-offline hidden>Нет связи с сервером — обновлю очередь, когда связь вернётся.</p>
 <div class="live" data-live data-version="{{ version }}" data-lib-version="{{ lib_version }}" data-notes="{{ notes_total }}" data-active="{{ active|length }}" data-busy="{{ 1 if busy else 0 }}">
   <section class="section" id="queue" aria-labelledby="queue-title" data-live-queue>
     {% include "_queue.html" %}
