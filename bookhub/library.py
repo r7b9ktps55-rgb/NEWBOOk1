@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +17,11 @@ def read_meta(path: Path) -> dict[str, str]:
             head = f.read(4096)
     except OSError:
         return {}
+    return parse_meta(head)
+
+
+def parse_meta(head: str) -> dict[str, str]:
+    """Поля frontmatter из начала текста заметки."""
     if not head.startswith("---\n"):
         return {}
     end = head.find("\n---", 4)
@@ -51,6 +57,20 @@ class Book:
     @property
     def formats(self) -> set[str]:
         return {n.fmt for n in self.notes}
+
+    @property
+    def title(self) -> str:
+        return self.name.rsplit(" - ", 1)[0].strip() or self.name
+
+    @property
+    def author(self) -> str:
+        parts = self.name.rsplit(" - ", 1)
+        return parts[1].strip() if len(parts) == 2 else ""
+
+    @property
+    def spine(self) -> int:
+        """Цвет корешка карточки: стабильный для одной и той же книги."""
+        return zlib.crc32(self.name.encode()) % 4
 
 
 def library(books_dir: Path) -> list[Book]:

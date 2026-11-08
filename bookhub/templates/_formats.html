@@ -1,17 +1,17 @@
+{% from "_icons.html" import icon %}
+{% macro chip(f, checked) -%}
+<label class="chip" title="{{ f.hint }}"><input type="checkbox" name="formats" value="{{ f.id }}" {% if f.id in checked %}checked{% endif %}><span>{{ icon("check", "tick") }}{{ f.label }}</span></label>
+{%- endmacro %}
 {% macro picker(formats, checked=(), exclude=()) %}
-<div class="formats">
-  <p class="group">Разбор</p>
+<fieldset class="formats">
+  <legend class="caps">Разбор</legend>
   <div class="chips">
-    {% for f in formats.values() if not f.ratio and f.id not in exclude %}
-    <label class="chip"><input type="checkbox" name="formats" value="{{ f.id }}" {% if f.id in checked %}checked{% endif %}><span>{{ f.label }}</span></label>
-    {% endfor %}
+    {% for f in formats.values() if not f.ratio and f.id not in exclude %}{{ chip(f, checked) }}{% endfor %}
   </div>
-  <p class="group">Сжатый пересказ</p>
+  <p class="caps">Сжатый пересказ</p>
   <div class="chips">
-    {% for f in formats.values() if f.ratio and f.id not in exclude %}
-    <label class="chip"><input type="checkbox" name="formats" value="{{ f.id }}" {% if f.id in checked %}checked{% endif %}><span>{{ f.label }}</span></label>
-    {% endfor %}
+    {% for f in formats.values() if f.ratio and f.id not in exclude %}{{ chip(f, checked) }}{% endfor %}
   </div>
-  <p class="hint">Сжатие идёт по частям (~20 страниц на запрос), поэтому для толстой книги это много запросов к Gemini.</p>
-</div>
+  <p class="hint">Сжатие идёт частями (~20 страниц на запрос), поэтому для толстой книги это много запросов к Gemini.</p>
+</fieldset>
 {% endmacro %}

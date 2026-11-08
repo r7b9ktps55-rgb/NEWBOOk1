@@ -1,0 +1,20 @@
+{% from "_icons.html" import icon %}
+<div class="section-head">
+  <h2 class="h2" id="library-title">Библиотека <span class="count">{{ books|length }}</span></h2>
+  {% if books|length > 5 %}<input class="input filter" type="search" placeholder="Найти книгу" aria-label="Найти книгу" data-filter>{% endif %}
+</div>
+{% if books %}
+<ul class="books" data-stagger>
+  {% for b in books %}
+  <li class="book-card spine-{{ b.spine }}" data-title="{{ b.name|lower }}">
+    <a class="book-link" href="/notes/{{ b.notes[0].name|urlencode }}"><span class="t">{{ b.title }}</span>{% if b.author %}<span class="a">{{ b.author }}</span>{% endif %}</a>
+    <div class="tags">
+      {% for n in b.notes %}<a class="tag" href="/notes/{{ n.name|urlencode }}">{{ n.label }}</a>{% endfor %}
+    </div>
+  </li>
+  {% endfor %}
+</ul>
+<p class="hint" data-filter-empty hidden>Ничего не нашлось.</p>
+{% else %}
+<div class="empty">{{ icon("book") }}<b>Здесь появятся заметки</b><span>Первая книга будет готова после разбора очереди.</span></div>
+{% endif %}

@@ -117,7 +117,7 @@ def test_several_formats_make_several_notes(tmp_path):
     names = sorted(p.name for p in s.books_dir.glob("*.md"))
     assert names == ["Б - Автор (герои).md", "Б - Автор (сжатие x3).md", "Б - Автор (цитаты).md"]
     home = client.get("/", auth=AUTH).text
-    assert home.count('class="book"') == 1  # одна книга в библиотеке, три формата
+    assert home.count('class="book-card') == 1  # одна книга в библиотеке, три формата
     assert "Лучшие цитаты по темам" in home and "Герои (ГГ и персонажи)" in home
 
 
@@ -135,7 +135,7 @@ def test_more_formats_from_note_page(tmp_path):
     assert fake.calls[-1] == ("file", "Книга.pdf", "x5", "Книга - Автор")  # PDF взят из архива
     assert (s.books_dir / "Книга - Автор (сжатие x5).md").exists()
     page = client.get("/notes/Книга - Автор (сжатие x5).md", auth=AUTH).text
-    assert 'class="tag link current"' in page and "Ключевые моменты" in page
+    assert 'class="tag current"' in page and 'aria-current="page"' in page and "Ключевые моменты" in page
 
 
 def test_more_formats_without_source(tmp_path):
@@ -564,7 +564,7 @@ def test_upload_epub_fb2_txt_and_process(tmp_path):
     assert r.headers["location"] == "/?m=rejected"
     assert sorted(p.name for p in s.inbox.iterdir()) == ["Заметки.txt", "Мастер.epub"]
     home = client.get("/", auth=AUTH).text
-    assert '<span class="kind">EPUB</span>' in home and '<span class="kind">TXT</span>' in home
+    assert '<span class="job-type">EPUB</span>' in home and '<span class="job-type">TXT</span>' in home
     assert run_queue(app) == 2
     assert (s.archive / "Мастер.epub").exists()
     assert read_meta(s.books_dir / "Мастер - Автор.md")["source"] == "Мастер.epub"
@@ -620,3 +620,64 @@ def test_djvu_is_converted(tmp_path):
     assert run_queue(app) == 1
     assert fake.calls[0][1] == "Скан.djvu.pdf"  # в модель уходит PDF
     assert read_meta(s.books_dir / "Скан.djvu - Автор.md")["source"] == "Скан.djvu"
+
+
+# ---------- новый интерфейс ----------
+
+def test_live_endpoint_updates_without_reload(tmp_path):
+    fake = FakeSummarizer()
+    client, s, app = make(tmp_path, fake)
+    assert client.get("/live").status_code == 401
+    first = client.get("/live", auth=AUTH).json()
+    assert first["active"] == 0 and first["notes"] == 0 and "Очередь пуста" in first["queue"]
+    assert first["library"] is not None  # версия библиотеки не передана — отдаём её целиком
+    same = client.get(f"/live?lib={first['lib_version']}", auth=AUTH).json()
+    assert same["library"] is None and same["version"] == first["version"]  # ничего не изменилось
+    upload(client, "a.pdf", formats=["summary", "quotes"])
+    queued = client.get(f"/live?lib={first['lib_version']}", auth=AUTH).json()
+    assert queued["version"] != first["version"] and queued["active"] == 1 and 'data-job="1"' in queued["queue"]
+    run_queue(app)
+    done = client.get(f"/live?lib={first['lib_version']}", auth=AUTH).json()
+    assert done["notes"] == 2 and done["active"] == 0 and done["library"] and "book-card" in done["library"]
+    assert done["lib_version"] != first["lib_version"]
+
+
+def test_index_page_has_redesign_parts(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    html = client.get("/", auth=AUTH).text
+    assert 'data-scene' in html and "<summary" not in html  # пустая библиотека: ролик открыт сразу
+    assert 'data-version="' in html and 'data-drop' in html and ".fb2.zip" in html
+    assert '<script type="module" src="/static/app.js?v=' in html
+    upload(client, "a.pdf")
+    run_queue(app)
+    html = client.get("/", auth=AUTH).text
+    assert "Как это работает</summary>" in html and "hero-compact" in html  # книги есть: ролик свёрнут
+    assert 'class="book-card spine-' in html
+
+
+def test_note_page_shows_properties(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "Книга.pdf", formats=["x3"])
+    run_queue(app)
+    page = client.get("/notes/Книга - Автор (сжатие x3).md", auth=AUTH).text
+    assert '<span class="caps">Сжатие ×3</span>' in page
+    assert '<dt>Источник</dt><dd>Книга.pdf</dd>' in page and '<dt>Статус</dt><dd>не прочитано</dd>' in page
+    assert '<p class="byline">Автор</p>' in page
+
+
+def test_flash_messages_have_kind(tmp_path):
+    client, _, _ = make(tmp_path)
+    assert 'class="flash ok"' in client.get("/?m=added", auth=AUTH).text
+    assert 'class="flash warn"' in client.get("/?m=badurl", auth=AUTH).text
+    assert "data-flash" not in client.get("/?m=nonsense", auth=AUTH).text
+
+
+def test_static_assets_cached_and_compressed(tmp_path):
+    client, _, _ = make(tmp_path)
+    r = client.get("/static/vendor/motion.min.js", headers={"Accept-Encoding": "gzip"})
+    assert r.status_code == 200 and r.headers["content-encoding"] == "gzip"
+    assert "max-age=604800" in r.headers["cache-control"]
+    font = client.get("/static/fonts/mulish-cyrillic-wght-normal.woff2")
+    assert font.status_code == 200 and font.content[:4] == b"wOF2"
+    assert client.get("/", auth=AUTH).headers["cache-control"] == "no-store"
+    assert client.get("/static/favicon.svg").status_code == 200

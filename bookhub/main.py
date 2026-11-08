@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import secrets
@@ -16,12 +17,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.gzip import GZipMiddleware
 
 from .config import Settings
 from .extract import FORMATS as FILE_TYPES, looks_valid, split_name
 from .formats import FORMATS, parse_formats
 from .gitsync import GitSync
-from .library import find_book, library
+from .library import find_book, library, parse_meta
 from .store import JobStore
 from .summarizer import GeminiSummarizer, Summarizer, safe_filename
 from .worker import Processor
@@ -30,20 +32,25 @@ log = logging.getLogger("bookhub")
 HERE = Path(__file__).parent
 OBSIDIAN_URI_LIMIT = 60_000
 
+# Сообщения после действий: (текст, вид). «ok» — подтверждение, «warn» — что-то не так.
 MESSAGES = {
-    "added": "Добавлено в очередь",
-    "rejected": "Некоторые файлы пропущены: формат не поддерживается, файл повреждён или больше лимита",
-    "nothing": "Выберите файл книги или вставьте ссылку",
-    "badurl": "Нужна ссылка вида https://…",
-    "more": "Новые форматы добавлены в очередь",
-    "nosource": "Исходник этой книги не найден — загрузите файл книги заново",
-    "started": "Обработка запущена — страница обновится сама",
-    "busy": "Уже идёт обработка, подождите",
-    "nokey": "Не задан GEMINI_API_KEY — конспекты делать нечем",
-    "empty": "Очередь пуста",
-    "retry": "Задача снова в очереди",
-    "deleted": "Удалено",
+    "added": ("Добавлено в очередь", "ok"),
+    "rejected": ("Некоторые файлы пропущены: формат не поддерживается, файл повреждён или больше лимита", "warn"),
+    "nothing": ("Выберите файл книги или вставьте ссылку", "warn"),
+    "badurl": ("Нужна ссылка вида https://…", "warn"),
+    "more": ("Новые форматы добавлены в очередь", "ok"),
+    "nosource": ("Исходник этой книги не найден — загрузите файл книги заново", "warn"),
+    "started": ("Обработка запущена — очередь обновится сама", "ok"),
+    "busy": ("Уже идёт обработка, подождите", "warn"),
+    "nokey": ("Не задан GEMINI_API_KEY — конспекты делать нечем", "warn"),
+    "empty": ("Очередь пуста", "warn"),
+    "retry": ("Задача снова в очереди", "ok"),
+    "deleted": ("Удалено", "ok"),
 }
+
+# Подписи полей frontmatter на странице заметки (title, author, book и format показываются в заголовке)
+PROP_LABELS = {"created": "Создано", "source": "Источник", "status": "Статус", "tags": "Теги"}
+STATUS_LABELS = {"unread": "не прочитано", "reading": "читаю", "read": "прочитано"}
 
 CSP = (
     "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
@@ -67,6 +74,34 @@ def render_note(text: str) -> tuple[str, str]:
     html = re.sub(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", lambda m: f'<span class="wikilink">{m.group(2) or m.group(1)}</span>', html)
     html = re.sub(r"\[!(\w+)\]", r'<span class="callout">\1</span>', html)
     return front, html
+
+
+def note_props(meta: dict[str, str]) -> list[tuple[str, str]]:
+    """Свойства заметки для показа: понятные подписи вместо ключей frontmatter."""
+    props = []
+    for key, label in PROP_LABELS.items():
+        value = meta.get(key, "")
+        if key == "status":
+            value = STATUS_LABELS.get(value, value)
+        if key == "tags":
+            value = value.strip("[]")
+        if value:
+            props.append((label, value))
+    if meta.get("words") and meta.get("source_words"):
+        props.append(("Объём", f"≈ {int(meta['words']):,} слов из {int(meta['source_words']):,}".replace(",", " ")))
+    hidden = {*PROP_LABELS, "title", "author", "book", "format", "words", "source_words"}
+    props += [(k, v) for k, v in meta.items() if k not in hidden and v]
+    return props
+
+
+def static_version(folder: Path) -> str:
+    """Меняется при любом изменении файлов в static/ — чтобы браузер не держал старые стили и скрипты."""
+    h = hashlib.sha1()
+    for p in sorted(folder.rglob("*")):
+        if p.is_file():
+            st = p.stat()
+            h.update(f"{p.relative_to(folder)}:{st.st_size}:{st.st_mtime_ns}".encode())
+    return h.hexdigest()[:10]
 
 
 def create_app(settings: Settings | None = None, summarizer: Summarizer | None = None,
@@ -105,6 +140,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     templates = Jinja2Templates(directory=HERE / "templates")
+    templates.env.globals["asset_v"] = static_version(HERE / "static")
     security = HTTPBasic(realm="Book Hub")
 
     @app.middleware("http")
@@ -113,7 +149,14 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         resp.headers["Content-Security-Policy"] = CSP
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "same-origin"
+        if request.url.path.startswith("/static/") and resp.status_code == 200:
+            # Стили и скрипты подключаются с ?v=<версия>, поэтому их можно кэшировать надолго.
+            resp.headers["Cache-Control"] = "public, max-age=604800"
+        elif "cache-control" not in resp.headers:
+            resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     def auth(request: Request, c: HTTPBasicCredentials = Depends(security)) -> str:
         ok_user = secrets.compare_digest(c.username.encode(), s.web_user.encode())
@@ -153,22 +196,60 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     async def health():
         return JSONResponse({"ok": True})
 
+    def page_state() -> dict:
+        """Всё, что нужно очереди и библиотеке; version меняется при любом изменении."""
+        jobs = store.list()
+        active = [j for j in jobs if j.status != "done"]
+        books = library(s.books_dir)
+        busy = proc.busy or any(j.status == "processing" for j in jobs)
+        queue_sig = repr([(j.id, j.status, j.progress, j.done_formats, j.error) for j in active]) + repr(busy)
+        lib_sig = repr([(b.name, [n.name for n in b.notes], round(b.mtime, 3)) for b in books])
+        lib_version = hashlib.sha1(lib_sig.encode()).hexdigest()[:12]
+        return {
+            "s": s,
+            "git": git,
+            "formats": FORMATS,
+            "has_key": summarizer is not None,
+            "active": active,
+            "books": books,
+            "busy": busy,
+            "notes_total": sum(len(b.notes) for b in books),
+            "lib_version": lib_version,
+            "version": hashlib.sha1((queue_sig + lib_version + str(git.last_error)).encode()).hexdigest()[:12],
+        }
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request, m: str = "", _: str = Depends(auth)):
         await asyncio.to_thread(proc.sync_inbox)
-        jobs = store.list()
-        active = [j for j in jobs if j.status != "done"]
+        state = await asyncio.to_thread(page_state)
+        text, kind = MESSAGES.get(m, ("", ""))
+        types = list(FILE_TYPES.values())
         return templates.TemplateResponse(request, "index.html", {
-            "s": s,
-            "message": MESSAGES.get(m, ""),
-            "active": active,
-            "books": await asyncio.to_thread(library, s.books_dir),
-            "formats": FORMATS,
+            **state,
+            "message": text,
+            "message_kind": kind,
             "checked": s.default_formats,
-            "file_types": sorted(set(FILE_TYPES.values()), key=list(FILE_TYPES.values()).index),
-            "busy": proc.busy or any(j.status == "processing" for j in jobs),
-            "has_key": summarizer is not None,
-            "git": git,
+            "file_types": sorted(set(types), key=types.index),
+            "file_exts": list(FILE_TYPES),
+        })
+
+    @app.get("/live")
+    async def live(lib: str = "", _: str = Depends(auth)):
+        """Состояние очереди для обновления страницы без перезагрузки."""
+        await asyncio.to_thread(proc.sync_inbox)
+        state = await asyncio.to_thread(page_state)
+        queue_html = templates.env.get_template("_queue.html").render(state)
+        library_html = None
+        if lib != state["lib_version"]:
+            library_html = templates.env.get_template("_library.html").render(state)
+        return JSONResponse({
+            "version": state["version"],
+            "lib_version": state["lib_version"],
+            "active": len(state["active"]),
+            "busy": state["busy"],
+            "notes": state["notes_total"],
+            "queue": queue_html,
+            "library": library_html,
         })
 
     async def save_file(f: UploadFile) -> Path | None:
@@ -249,8 +330,14 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             params = {"vault": s.obsidian_vault_name, **params}
         uri = "obsidian://new?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
         book = await asyncio.to_thread(find_book, s.books_dir, path.name)
+        meta = parse_meta(text)
+        fmt = FORMATS.get(meta.get("format", ""), FORMATS["summary"] if meta else None)
         return templates.TemplateResponse(request, "note.html", {
-            "title": path.stem, "name": path.name, "front": front, "html": html, "raw": text,
+            "heading": meta.get("title") or path.stem,
+            "author": meta.get("author", ""),
+            "format_label": fmt.label if fmt else "Заметка",
+            "props": note_props(meta),
+            "name": path.name, "front": front, "html": html, "raw": text,
             "obsidian_uri": uri if len(uri) <= OBSIDIAN_URI_LIMIT else "",
             "book": book, "formats": FORMATS, "has_key": summarizer is not None,
         })

@@ -1,0 +1,25 @@
+{% from "_icons.html" import icon %}
+<div class="scene" data-scene>
+  <div class="sc-stage" data-sc="stage" role="img" aria-label="Ролик «Как это работает»: книга в формате EPUB попадает в Gemini, он её читает и создаёт заметки — конспект, цитаты и сжатый втрое пересказ, — которые сохраняются в папку Books хранилища Obsidian.">
+    <div class="sc-dots"></div>
+    <div class="sc-book" data-sc="book"><div class="sc-title"><i></i><i></i></div><span class="sc-type" data-sc="type">EPUB</span></div>
+    <div class="sc-lines" data-sc="lines"><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="sc-core" data-sc="core">
+      <svg class="sc-ring" viewBox="0 0 36 36" aria-hidden="true"><circle class="track" cx="18" cy="18" r="16.5"/><circle class="ring-bar" data-sc="ring" cx="18" cy="18" r="16.5" pathLength="1"/></svg>
+      <div class="sc-core-dot">{{ icon("sparkle") }}</div>
+      <span class="sc-core-label" data-sc="core-label">Gemini</span>
+    </div>
+    <div class="sc-notes">
+      <div class="sc-note" data-sc="note"><b>Конспект</b><div class="sc-mark-row"><span class="sc-mark" data-sc="mark"></span><i></i></div><i></i></div>
+      <div class="sc-note" data-sc="note"><b>Цитаты</b><span class="sc-quote">“</span><i></i><i class="short"></i></div>
+      <div class="sc-note" data-sc="note"><b>Сжатие ×3</b><div class="sc-squeeze-row"><div class="sc-squeeze"><span data-sc="squeeze"></span></div><span class="sc-count" data-sc="count">100 стр.</span></div></div>
+    </div>
+    <div class="sc-file" data-sc="file">{{ icon("note") }}<span class="sc-file-text" data-sc="file-text">Books/Мастер и Маргарита (цитаты).md</span><span class="sc-caret"></span></div>
+  </div>
+  <button class="sc-play" type="button" data-sc="play" aria-label="Пауза" hidden>{{ icon("pause", "i-pause") }}{{ icon("play", "i-play") }}</button>
+</div>
+<ol class="steps">
+  <li class="step" data-step="0"><span class="step-ico">{{ icon("upload") }}</span><h3>Добавьте книгу</h3><p>PDF, EPUB, FB2, DjVu, DOCX, TXT или ссылка на статью.</p></li>
+  <li class="step" data-step="1"><span class="step-ico">{{ icon("sparkle") }}</span><h3>Gemini читает</h3><p>Конспект, ключевые моменты, цитаты, герои, карточки или сжатие ×2–×5.</p></li>
+  <li class="step" data-step="2"><span class="step-ico">{{ icon("note") }}</span><h3>Заметки в Obsidian</h3><p>Markdown с тегами и ссылками: открыть в Obsidian, скачать или отправить в Git.</p></li>
+</ol>

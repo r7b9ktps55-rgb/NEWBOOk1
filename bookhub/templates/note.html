@@ -1,32 +1,38 @@
 {% extends "base.html" %}
 {% from "_formats.html" import picker %}
-{% block title %}{{ title }} — Book Hub{% endblock %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ heading }} — Book Hub{% endblock %}
+{% block nav %}<div class="nav-links"><a href="/#library">Библиотека</a></div>{% endblock %}
 {% block content %}
-<p><a href="/" class="back">← Назад</a></p>
-<article class="card note">
+<article class="reader" data-reveal>
+  <a href="/#library" class="back">← Библиотека</a>
   {% if book and book.notes|length > 1 %}
   <nav class="tags" aria-label="Форматы этой книги">
-    {% for n in book.notes %}<a class="tag link {% if n.name == name %}current{% endif %}" href="/notes/{{ n.name|urlencode }}">{{ n.label }}</a>{% endfor %}
+    {% for n in book.notes %}<a class="tag {% if n.name == name %}current{% endif %}" href="/notes/{{ n.name|urlencode }}" {% if n.name == name %}aria-current="page"{% endif %}>{{ n.label }}</a>{% endfor %}
   </nav>
   {% endif %}
-  <h1>{{ title }}</h1>
+  <header class="reader-head">
+    <span class="caps">{{ format_label }}</span>
+    <h1><span class="marker" data-draw>{{ heading }}</span></h1>
+    {% if author %}<p class="byline">{{ author }}</p>{% endif %}
+  </header>
   <div class="toolbar">
-    {% if obsidian_uri %}<a class="btn primary" href="{{ obsidian_uri }}">Открыть в Obsidian</a>{% endif %}
-    <button class="btn" type="button" data-copy="raw">Скопировать Markdown</button>
-    <a class="btn" href="/notes/{{ name|urlencode }}/download">Скачать .md</a>
-    <form action="/notes/{{ name|urlencode }}/delete" method="post" data-confirm="Удалить заметку «{{ title }}»?">
-      <button class="btn ghost">Удалить</button>
+    {% if obsidian_uri %}<a class="btn primary" href="{{ obsidian_uri }}">{{ icon("open") }}В Obsidian</a>{% endif %}
+    <button class="btn ghost" type="button" data-copy="raw">{{ icon("copy") }}<span>Скопировать</span></button>
+    <a class="btn ghost" href="/notes/{{ name|urlencode }}/download">{{ icon("download") }}Скачать .md</a>
+    <form action="/notes/{{ name|urlencode }}/delete" method="post" data-confirm="Удалить заметку «{{ heading }}»?">
+      <button class="btn icon" aria-label="Удалить заметку">{{ icon("trash") }}</button>
     </form>
   </div>
-  {% if front %}<pre class="front">{{ front }}</pre>{% endif %}
-  <div class="md">{{ html|safe }}</div>
+  {% if props %}<dl class="props">{% for k, v in props %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl>{% endif %}
+  <div class="prose">{{ html|safe }}</div>
   <textarea id="raw" hidden readonly>{{ raw }}</textarea>
 </article>
 
 {% if book and book.formats|length < formats|length %}
-<details class="card more">
+<details class="card more reader">
   <summary>Сделать из этой книги ещё…</summary>
-  <form action="/notes/{{ name|urlencode }}/more" method="post">
+  <form action="/notes/{{ name|urlencode }}/more" method="post" data-busy-form>
     {{ picker(formats, (), book.formats) }}
     <button class="btn primary" {% if not has_key %}disabled{% endif %}>В очередь</button>
   </form>
