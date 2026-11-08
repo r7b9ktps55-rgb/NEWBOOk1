@@ -16,6 +16,9 @@ class ConfigError(Exception):
     pass
 
 
+MIN_PASSWORD = 10
+
+
 def _int(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -75,12 +78,19 @@ class Settings:
     def validate(self) -> None:
         if not self.web_password:
             raise ConfigError("Задайте WEB_PASSWORD в .env — без пароля сайт не запустится.")
+        if len(self.web_password) < MIN_PASSWORD:
+            raise ConfigError(f"WEB_PASSWORD слишком короткий: нужно не меньше {MIN_PASSWORD} символов.")
         if self.daily_time() is None and self.daily_run_time not in ("", "off"):
             raise ConfigError(f"DAILY_RUN_TIME должно быть в формате ЧЧ:ММ, сейчас: {self.daily_run_time!r}")
         if ".." in Path(self.vault_subfolder).parts or Path(self.vault_subfolder).is_absolute():
             raise ConfigError("OBSIDIAN_VAULT_SUBFOLDER должна быть относительной папкой внутри хранилища.")
         if self.daily_batch_size < 1:
             raise ConfigError("DAILY_BATCH_SIZE должно быть ≥ 1.")
+
+    @property
+    def max_request_bytes(self) -> int:
+        """Лимит одного запроса: до пяти книг максимального размера за раз."""
+        return (self.max_upload_mb * 5 + 1) * 1024 * 1024
 
     def daily_time(self) -> tuple[int, int] | None:
         m = re.fullmatch(r"(\d{1,2}):(\d{2})", self.daily_run_time)

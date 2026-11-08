@@ -35,6 +35,8 @@ FORMATS = {
 }
 ZIP_MAGIC = b"PK\x03\x04"
 MIN_TEXT = 200
+MAX_MEMBER = 128 * 1024 * 1024    # один файл внутри EPUB/DOCX/FB2.ZIP после распаковки
+MAX_UNPACKED = 512 * 1024 * 1024  # все главы EPUB вместе
 
 
 class ExtractError(Exception):
@@ -110,6 +112,18 @@ def decode(data: bytes) -> str:
     return data.decode("cp1251", errors="replace")  # самый частый случай для русских .txt
 
 
+def _read_member(z: zipfile.ZipFile, name: str, budget: list[int] | None = None) -> bytes:
+    """Читает файл из архива, не давая «zip-бомбе» развернуться в гигабайты в памяти."""
+    size = z.getinfo(name).file_size  # zipfile не распакует больше заявленного размера
+    if size > MAX_MEMBER:
+        raise ExtractError("Файл внутри архива слишком большой после распаковки (больше 128 МБ)")
+    if budget is not None:
+        budget[0] -= size
+        if budget[0] < 0:
+            raise ExtractError("Книга слишком большая после распаковки (больше 512 МБ)")
+    return z.read(name)
+
+
 def _local(tag) -> str:
     return tag.rsplit("}", 1)[-1].lower() if isinstance(tag, str) else ""
 
@@ -171,14 +185,14 @@ def read_epub(path: Path) -> Extracted:
     with z:
         names = set(z.namelist())
         if "META-INF/encryption.xml" in names:
-            enc = _xml(z.read("META-INF/encryption.xml"))
+            enc = _xml(_read_member(z, "META-INF/encryption.xml"))
             uris = [el.get("URI", "") for el in enc.iter() if _local(el.tag) == "cipherreference"]
             if any(not re.search(r"\.(ttf|otf|woff2?)$", u, re.I) for u in uris):
                 raise ExtractError("EPUB защищён DRM — снимите защиту или загрузите другой файл")
         try:
-            container = _xml(z.read("META-INF/container.xml"))
+            container = _xml(_read_member(z, "META-INF/container.xml"))
             opf_path = next(el.get("full-path") for el in container.iter() if _local(el.tag) == "rootfile")
-            opf = _xml(z.read(opf_path))
+            opf = _xml(_read_member(z, opf_path))
         except (KeyError, StopIteration) as exc:
             raise ExtractError("В EPUB нет оглавления (container.xml/OPF)") from exc
         base = posixpath.dirname(opf_path)
@@ -194,12 +208,14 @@ def read_epub(path: Path) -> Extracted:
             elif name == "creator" and not author:
                 author = (el.text or "").strip()
         chapters = []
+        budget = [MAX_UNPACKED]
         for el in opf.iter():
             if _local(el.tag) == "itemref":
                 href, media = manifest.get(el.get("idref"), ("", ""))
                 if href in names and ("html" in media or href.lower().endswith((".xhtml", ".html", ".htm"))):
+                    data = _read_member(z, href, budget)  # слишком большая книга — ошибка, а не пропуск
                     try:
-                        chapters.append(html_to_text(z.read(href)))
+                        chapters.append(html_to_text(data))
                     except ExtractError:
                         log.warning("Пропущена глава EPUB %s", href)
     return Extracted(clean("\n\n".join(c for c in chapters if c)), title, author)
@@ -212,7 +228,7 @@ def read_fb2(path: Path) -> Extracted:
             inner = [n for n in z.namelist() if n.lower().endswith(".fb2")]
             if not inner:
                 raise ExtractError("В архиве нет файла .fb2")
-            data = z.read(inner[0])
+            data = _read_member(z, inner[0])
     root = _xml(data)
     title = author = ""
     for el in root.iter():
@@ -253,8 +269,8 @@ def read_fb2(path: Path) -> Extracted:
 def read_docx(path: Path) -> Extracted:
     try:
         with zipfile.ZipFile(path) as z:
-            root = _xml(z.read("word/document.xml"))
-            core = _xml(z.read("docProps/core.xml")) if "docProps/core.xml" in z.namelist() else None
+            root = _xml(_read_member(z, "word/document.xml"))
+            core = _xml(_read_member(z, "docProps/core.xml")) if "docProps/core.xml" in z.namelist() else None
     except (zipfile.BadZipFile, KeyError) as exc:
         raise ExtractError("Файл DOCX повреждён") from exc
     out = []

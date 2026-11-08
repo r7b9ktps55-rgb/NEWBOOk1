@@ -18,7 +18,7 @@ from bookhub.summarizer import (GeminiSummarizer, Summary, page_groups, parse_ou
                                 split_text, with_frontmatter)
 from bookhub.worker import unique_path
 
-AUTH = ("me", "secret")
+AUTH = ("me", "secret-pass-42")
 PDF = b"%PDF-1.4\n%fake\n"
 
 
@@ -46,7 +46,7 @@ class FakeSummarizer:
 
 
 def make(tmp_path, summarizer=None, **kw):
-    s = Settings(web_password="secret", data_dir=tmp_path / "data", **kw)
+    s = Settings(web_password="secret-pass-42", data_dir=tmp_path / "data", **kw)
     app = create_app(s, summarizer=summarizer, start_scheduler=False)
     return TestClient(app), s, app
 
@@ -71,7 +71,7 @@ def test_auth(tmp_path):
     client, _, _ = make(tmp_path)
     assert client.get("/").status_code == 401
     assert client.get("/", auth=("me", "wrong")).status_code == 401
-    assert client.get("/", auth=("other", "secret")).status_code == 401
+    assert client.get("/", auth=("other", "secret-pass-42")).status_code == 401
     r = client.get("/", auth=AUTH)
     assert r.status_code == 200 and "Book Hub" in r.text and "Сжатие ×3" in r.text
     assert "default-src 'self'" in r.headers["content-security-policy"]
@@ -681,3 +681,120 @@ def test_static_assets_cached_and_compressed(tmp_path):
     assert font.status_code == 200 and font.content[:4] == b"wOF2"
     assert client.get("/", auth=AUTH).headers["cache-control"] == "no-store"
     assert client.get("/static/favicon.svg").status_code == 200
+
+
+# ---------- безопасность ----------
+
+def test_short_password_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="не меньше 10"):
+        create_app(Settings(web_password="123456", data_dir=tmp_path), start_scheduler=False)
+
+
+def test_guard_rejects_before_reading_body(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    r = client.post("/add", files=[("files", ("a.pdf", PDF * 1000, "application/pdf"))])
+    assert r.status_code == 401 and "Нужны логин и пароль" in r.text
+    assert 'charset="UTF-8"' in r.headers["www-authenticate"]
+    assert list(s.inbox.iterdir()) == [] and app.state.store.list() == []
+    # слишком большой запрос отсекается по Content-Length ещё до разбора формы
+    r = client.post("/add", auth=AUTH, content=b"x", headers={"content-length": str(s.max_request_bytes + 1),
+                                                              "content-type": "multipart/form-data; boundary=x"})
+    assert r.status_code == 413
+
+
+def test_login_rate_limit(tmp_path):
+    client, s, app = make(tmp_path)
+    now = [1000.0]
+    app.state.limiter.clock = lambda: now[0]
+    for _ in range(10):
+        assert client.get("/", auth=("me", "wrong-password")).status_code == 401
+    r = client.get("/", auth=AUTH)
+    assert r.status_code == 429 and r.headers["retry-after"] == "600"  # даже с верным паролем
+    assert client.get("/health").status_code == 200  # проверка здоровья не блокируется
+    now[0] += 601
+    assert client.get("/", auth=AUTH).status_code == 200
+    assert client.get("/").status_code == 401  # запрос без пароля не считается попыткой
+    assert not app.state.limiter.blocked("testclient")
+
+
+def test_markdown_cannot_inject_attributes_or_js_links():
+    _, html = render_note("## Т {: onclick=alert(1) }\n\n[жми](javascript:alert(1)) [ok](https://e.com) [[Тема]]\n\n"
+                          "Сноска[^1]\n\n[^1]: Текст\n")
+    assert "<h2>Т {: onclick=alert(1) }</h2>" in html  # осталось текстом, а не атрибутом
+    assert "<h2 " not in html and "javascript:" not in html
+    assert 'href="https://e.com"' in html and 'rel="noopener noreferrer"' in html
+    assert '<span class="wikilink">Тема</span>' in html and 'class="footnote"' in html
+
+
+def test_null_byte_in_note_name(tmp_path):
+    client, _, _ = make(tmp_path)
+    assert client.get("/notes/a.md%00.md", auth=AUTH).status_code == 404
+
+
+def test_zip_bomb_limit(tmp_path, monkeypatch):
+    import bookhub.extract as ex
+    p = tmp_path / "big.docx"
+    make_docx(p)
+    monkeypatch.setattr(ex, "MAX_MEMBER", 100)
+    with pytest.raises(ExtractError, match="слишком большой"):
+        extract_text(p)
+    e = tmp_path / "book.epub"
+    make_epub(e)
+    monkeypatch.setattr(ex, "MAX_MEMBER", 10_000_000)
+    monkeypatch.setattr(ex, "MAX_UNPACKED", 300)
+    with pytest.raises(ExtractError, match="512"):
+        extract_text(e)
+
+
+def test_git_token_never_in_args_or_errors(tmp_path, monkeypatch):
+    from bookhub import gitsync
+    s = Settings(web_password="secret-pass-42", data_dir=tmp_path / "data", git_repo_url="https://github.com/u/v.git",
+                 git_token="ghp_SECRET_TOKEN_123")
+    s.ensure_dirs()
+    g = gitsync.GitSync(s)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw["env"]
+        raise subprocess.TimeoutExpired(cmd, 180, output="Authorization: Basic " + g._basic())
+
+    monkeypatch.setattr(gitsync.subprocess, "run", fake_run)
+    assert g.sync("msg") is False
+    assert "ghp_SECRET_TOKEN_123" not in " ".join(seen["cmd"]) and g._basic() not in " ".join(seen["cmd"])
+    assert seen["env"]["GIT_CONFIG_KEY_0"] == "http.extraHeader"
+    assert "нет ответа" in g.last_error and "SECRET" not in g.last_error and g._basic() not in g.last_error
+    assert g._mask("fatal: https://user:ghp_SECRET_TOKEN_123@github.com/u/v.git") == "fatal: https://***@github.com/u/v.git"
+
+
+def test_git_conflict_prefers_vault_and_keeps_syncing(tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True)
+    client, s, app = make(tmp_path, FakeSummarizer(), git_repo_url=str(remote))
+    upload(client, "a.pdf")
+    run_queue(app)
+    # в Obsidian заметку отредактировали, а на сайте — удалили
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(remote), str(seed)], check=True, capture_output=True)
+    (seed / "Books" / "a - Автор.md").write_text("правка в Obsidian", "utf-8")
+    for cmd in (["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "edit"], ["push", "origin", "HEAD:main"]):
+        subprocess.run(["git", *cmd], cwd=seed, check=True, capture_output=True)
+    client.post("/notes/a - Автор.md/delete", auth=AUTH)
+    assert app.state.git.sync("Remove a") is True and app.state.git.last_error is None
+    assert (s.books_dir / "a - Автор.md").read_text("utf-8") == "правка в Obsidian"  # правка не потерялась
+    # и следующие синхронизации работают
+    upload(client, "b.pdf")
+    run_queue(app)
+    assert app.state.git.last_error is None and "Books/b - Автор.md" in ls_remote(remote)
+
+
+def test_books_folder_recreated_after_git_removes_it(tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(remote)], check=True, capture_output=True)
+    client, s, app = make(tmp_path, FakeSummarizer(), git_repo_url=str(remote))
+    upload(client, "a.pdf")
+    run_queue(app)
+    client.post("/notes/a - Автор.md/delete", auth=AUTH)
+    app.state.git.sync("Remove a")
+    assert s.books_dir.is_dir()
+    upload(client, "b.pdf")
+    assert run_queue(app) == 1

@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import markdown as md
+import nh3
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -23,6 +24,7 @@ from .config import Settings
 from .extract import FORMATS as FILE_TYPES, looks_valid, split_name
 from .formats import FORMATS, parse_formats
 from .gitsync import GitSync
+from .guard import GuardMiddleware, LoginLimiter
 from .library import find_book, library, parse_meta
 from .store import JobStore
 from .summarizer import GeminiSummarizer, Summarizer, safe_filename
@@ -58,6 +60,17 @@ CSP = (
 )
 
 
+# Markdown без attr_list и md_in_html: из текста заметки нельзя добавить атрибуты или сырой HTML.
+MD_EXTENSIONS = ["abbr", "def_list", "fenced_code", "footnotes", "tables", "sane_lists", "nl2br"]
+SAFE_TAGS = {
+    "p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "b", "i", "del", "s", "sup", "sub",
+    "code", "pre", "blockquote", "ul", "ol", "li", "dl", "dt", "dd", "table", "thead", "tbody", "tr", "th", "td",
+    "a", "span", "div", "abbr",
+}
+SAFE_ATTRS = {"a": {"href", "title"}, "abbr": {"title"}, "th": {"align"}, "td": {"align"}, "sup": {"id"}, "li": {"id"}}
+SAFE_CLASSES = {"span": {"wikilink", "callout"}, "a": {"footnote-ref", "footnote-backref"}, "div": {"footnote"}}
+
+
 def render_note(text: str) -> tuple[str, str]:
     """Возвращает (frontmatter, html). Сырой HTML из заметки не пропускаем."""
     front = ""
@@ -70,9 +83,12 @@ def render_note(text: str) -> tuple[str, str]:
     text = re.sub(r"^(?![\s>#*-])(.+?)::(.+)$", r"- **\1** — \2", text, flags=re.M)
     text = re.sub(r"^(\s*[-*]) \[ \]", r"\1 ☐", text, flags=re.M)
     text = re.sub(r"^(\s*[-*]) \[[xX]\]", r"\1 ☑", text, flags=re.M)
-    html = md.markdown(text, extensions=["extra", "sane_lists", "nl2br"])
+    html = md.markdown(text, extensions=MD_EXTENSIONS)
     html = re.sub(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", lambda m: f'<span class="wikilink">{m.group(2) or m.group(1)}</span>', html)
     html = re.sub(r"\[!(\w+)\]", r'<span class="callout">\1</span>', html)
+    # Последний рубеж: только разрешённые теги, атрибуты и ссылки http(s)/mailto.
+    html = nh3.clean(html, tags=SAFE_TAGS, attributes=SAFE_ATTRS, allowed_classes=SAFE_CLASSES,
+                     url_schemes={"http", "https", "mailto"})
     return front, html
 
 
@@ -110,8 +126,6 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     s = settings or Settings.from_env()
     s.validate()
     s.ensure_dirs()
-    if s.web_password in ("admin", "password", "123456"):
-        log.warning("WEB_PASSWORD слишком простой — смените его, если сайт доступен из интернета")
 
     if summarizer is None and s.gemini_api_key:
         summarizer = GeminiSummarizer(s.gemini_api_key, s.gemini_model, s.data_dir)
@@ -157,6 +171,10 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         return resp
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # Добавляется последним, значит срабатывает первым: до разбора формы и записи файлов.
+    limiter = LoginLimiter()
+    app.add_middleware(GuardMiddleware, user=s.web_user, password=s.web_password,
+                       max_body=s.max_request_bytes, limiter=limiter)
 
     def auth(request: Request, c: HTTPBasicCredentials = Depends(security)) -> str:
         ok_user = secrets.compare_digest(c.username.encode(), s.web_user.encode())
@@ -175,8 +193,11 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
 
     def note_path(name: str) -> Path:
         base = s.books_dir.resolve()
-        path = (base / name).resolve()
-        if path.parent != base or path.suffix != ".md" or not path.is_file():
+        try:
+            path = (base / name).resolve()
+        except (ValueError, OSError):  # например, нулевой байт в имени
+            raise HTTPException(404, "Заметка не найдена") from None
+        if "\x00" in name or path.parent != base or path.suffix != ".md" or not path.is_file():
             raise HTTPException(404, "Заметка не найдена")
         return path
 
@@ -372,5 +393,5 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             t.add_done_callback(tasks.discard)
         return back("deleted")
 
-    app.state.store, app.state.processor, app.state.git = store, proc, git
+    app.state.store, app.state.processor, app.state.git, app.state.limiter = store, proc, git, limiter
     return app

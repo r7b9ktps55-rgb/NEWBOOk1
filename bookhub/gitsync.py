@@ -5,13 +5,17 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import subprocess
 import threading
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .config import Settings
 
 log = logging.getLogger(__name__)
+
+GIT_TIMEOUT_S = 180
 
 
 class GitError(Exception):
@@ -30,18 +34,29 @@ class GitSync:
     def enabled(self) -> bool:
         return bool(self.s.git_repo_url)
 
+    def _basic(self) -> str:
+        return base64.b64encode(f"x-access-token:{self.s.git_token}".encode()).decode()
+
     def _mask(self, text: str) -> str:
-        return text.replace(self.s.git_token, "***") if self.s.git_token else text
+        """Убирает из текста токен в любом виде и логин:пароль из адресов."""
+        if self.s.git_token:
+            text = text.replace(self._basic(), "***").replace(self.s.git_token, "***")
+        return re.sub(r"(https?://)[^/@\s]+@", r"\1***@", text)
 
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        cmd = ["git"]
-        if self.s.git_token:
-            # Токен передаём только в заголовке команды — в .git/config он не попадает.
-            basic = base64.b64encode(f"x-access-token:{self.s.git_token}".encode()).decode()
-            cmd += ["-c", f"http.extraHeader=Authorization: Basic {basic}"]
-        cmd += list(args)
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-        res = subprocess.run(cmd, cwd=self.vault, capture_output=True, text=True, timeout=180, env=env)
+        if self.s.git_token:
+            # Токен — через переменные окружения процесса git: его нет ни в аргументах (ps), ни в .git/config.
+            env.update({
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                "GIT_CONFIG_VALUE_0": f"Authorization: Basic {self._basic()}",
+            })
+        try:
+            res = subprocess.run(["git", *args], cwd=self.vault, capture_output=True, text=True,
+                                 timeout=GIT_TIMEOUT_S, env=env)
+        except subprocess.TimeoutExpired:
+            raise GitError(f"git {args[0]}: нет ответа дольше {GIT_TIMEOUT_S} с") from None
         if check and res.returncode != 0:
             raise GitError(self._mask(f"git {args[0]}: {(res.stderr or res.stdout).strip()}"))
         return res
@@ -54,15 +69,27 @@ class GitSync:
         self._git("remote", "add", "origin", self.s.git_repo_url)
         self._git("config", "user.name", self.s.git_author_name)
         self._git("config", "user.email", self.s.git_author_email)
-        # Если в репозитории уже есть хранилище — встаём поверх него, не трогая локальные файлы.
         if self._git("fetch", "origin", self.s.git_branch, check=False).returncode == 0:
+            # В репозитории уже есть хранилище: встаём поверх него. Для файлов, которые есть и там, и здесь,
+            # берём версию из репозитория (её могли править в Obsidian), новые локальные заметки остаются.
             self._git("reset", f"origin/{self.s.git_branch}")
-            # Заметки, которые есть только в репозитории, возвращаем на диск,
-            # иначе следующий коммит их удалит.
-            missing = self._git("ls-files", "--deleted", "-z").stdout.split("\0")
-            missing = [f for f in missing if f]
-            if missing:
-                self._git("checkout", "--", *missing)
+            self._git("checkout", "--", ".", check=False)
+
+    def _merge_preferring_remote(self) -> None:
+        """Конфликт при pull: слияние, где побеждает версия из репозитория."""
+        self._git("rebase", "--abort", check=False)
+        merge = self._git("merge", "--no-edit", "-X", "theirs", f"origin/{self.s.git_branch}", check=False)
+        if merge.returncode == 0:
+            return
+        unmerged = self._git("diff", "--name-only", "--diff-filter=U").stdout.split("\n")
+        for path in filter(None, unmerged):
+            # Файл есть в репозитории — берём его оттуда; удалён там — удаляем и у нас.
+            if self._git("checkout", "--theirs", "--", path, check=False).returncode == 0:
+                self._git("add", "--", path)
+            else:
+                self._git("rm", "-f", "--quiet", "--", path)
+        self._git("commit", "--no-edit", "-m", "Merge vault changes")
+        log.warning("Git: конфликт решён в пользу версии из репозитория")
 
     def sync(self, message: str) -> bool:
         if not self.enabled:
@@ -73,15 +100,21 @@ class GitSync:
                 self._git("add", "-A")
                 if self._git("diff", "--cached", "--quiet", check=False).returncode != 0:
                     self._git("commit", "-m", message)
-                pull = self._git("pull", "--rebase", "origin", self.s.git_branch, check=False)
-                if pull.returncode != 0 and "couldn't find remote ref" not in pull.stderr:
-                    self._git("rebase", "--abort", check=False)
-                    raise GitError(self._mask(f"git pull: {pull.stderr.strip()}"))
+                fetch = self._git("fetch", "origin", self.s.git_branch, check=False)
+                if fetch.returncode == 0:
+                    pull = self._git("rebase", f"origin/{self.s.git_branch}", check=False)
+                    if pull.returncode != 0:
+                        self._merge_preferring_remote()
+                elif "couldn't find remote ref" not in fetch.stderr:
+                    raise GitError(self._mask(f"git fetch: {fetch.stderr.strip()}"))
                 self._git("push", "origin", f"HEAD:{self.s.git_branch}")
                 self.last_error = None
-                self.last_sync = datetime.now().strftime("%Y-%m-%d %H:%M")
+                self.last_sync = datetime.now(ZoneInfo(self.s.timezone)).strftime("%Y-%m-%d %H:%M")
                 return True
-            except (GitError, OSError, subprocess.TimeoutExpired) as exc:
+            except (GitError, OSError) as exc:
                 self.last_error = self._mask(str(exc))
                 log.error("Git: %s", self.last_error)
                 return False
+            finally:
+                # git удаляет пустые папки — папка для заметок должна существовать всегда.
+                self.s.books_dir.mkdir(parents=True, exist_ok=True)
