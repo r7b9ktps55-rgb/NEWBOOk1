@@ -395,8 +395,8 @@ def test_gemini_pdf_formats_and_compression(tmp_path):
     assert [o.fmt for o in out] == ["summary", "quotes", "x3"]
     assert all(o.book == "Книга - Автор" for o in out)
     assert len(c.uploads) == 1 and c.deleted == ["files/1"]  # весь PDF загружен один раз на оба формата
-    compress = [r for r in c.requests if isinstance(r[0], dict)]
-    assert len(compress) == 3 and compress[0][0]["inline_data"]["mime_type"] == "application/pdf"
+    compress = [r for r in c.requests if getattr(r[0], "inline_data", None)]
+    assert len(compress) == 3 and compress[0][0].inline_data.mime_type == "application/pdf"
     assert "до 2000 слов" in compress[0][1]  # 20 стр × 300 слов / 3
     assert "FILENAME" not in compress[0][1]  # имя книги уже известно из конспекта
     assert out[2].markdown.startswith("> [!info] Сжатие ×3")

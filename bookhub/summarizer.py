@@ -294,7 +294,10 @@ class GeminiSummarizer:
             uploaded = None
             if isinstance(content, bytes):
                 if len(content) <= INLINE_LIMIT:
-                    content = {"inline_data": {"mime_type": "application/pdf", "data": content}}
+                    from google.genai import types
+
+                    # Официальный конструктор: SDK сам сериализует поля как inlineData / mimeType.
+                    content = types.Part.from_bytes(data=content, mime_type="application/pdf")
                 else:
                     content = uploaded = self._upload(io.BytesIO(content), f"часть {i + 1}")
             try:
