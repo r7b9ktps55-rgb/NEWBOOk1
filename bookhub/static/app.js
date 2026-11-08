@@ -1,6 +1,6 @@
 // Book Hub: анимации (Motion), живая очередь, загрузка перетаскиванием, ролик «Как это работает».
 // Без JavaScript сайт полностью работает; этот файл только улучшает его.
-import { animate, inView, stagger } from "./vendor/motion.min.js";
+import { animate, inView, stagger } from "./vendor/motion-14.6.0.min.js";
 
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const EASE = [0.22, 1, 0.36, 1];
@@ -13,17 +13,24 @@ const ICONS = {
 };
 
 // ---------- Появление блоков ----------
+const STAGGER_MAX = 12; // дальше элементы появляются сразу, без «лесенки»
+
 function showNow(el) {
   el.style.animation = "none";
   el.style.opacity = "1";
 }
 
+// Уже видимое (например, после страховки по таймеру) не прячем и не проявляем заново — иначе мигает.
+const alreadyShown = (el) => getComputedStyle(el).opacity === "1";
+
 function revealList(list) {
-  const kids = [...list.children];
+  const kids = [...list.children].filter((k) => !alreadyShown(k));
   if (!kids.length) return;
-  kids.forEach((k) => (k.style.animation = "none"));
-  animate(kids, { opacity: [0, 1], y: [10, 0] }, { delay: stagger(0.045), duration: 0.4, ease: EASE })
-    .then(() => kids.forEach((k) => (k.style.transform = "")));
+  const first = kids.slice(0, STAGGER_MAX);
+  kids.slice(STAGGER_MAX).forEach(showNow);
+  first.forEach((k) => (k.style.animation = "none"));
+  animate(first, { opacity: [0, 1], y: [10, 0] }, { delay: stagger(0.045), duration: 0.4, ease: EASE })
+    .then(() => first.forEach((k) => (k.style.transform = "")));
 }
 
 function setupReveal(root = document) {
@@ -35,10 +42,12 @@ function setupReveal(root = document) {
     return;
   }
   inView(blocks, (el) => {
+    if (alreadyShown(el)) return showNow(el);
     el.style.animation = "none";
     animate(el, { opacity: [0, 1], y: [14, 0] }, { duration: 0.5, ease: EASE }).then(() => (el.style.transform = ""));
-  }, { amount: 0.1 });
-  inView(lists, (list) => revealList(list), { amount: 0.05 });
+  }, { amount: 0 });
+  // amount: 0 — список выше экрана тоже срабатывает, как только показался его край
+  inView(lists, (list) => revealList(list), { amount: 0 });
   inView(root.querySelectorAll("[data-draw]"), (el) => el.classList.add("is-drawn"), { amount: 0.6 });
 }
 
@@ -56,10 +65,24 @@ function toast(text, kind = "ok", action = null) {
   if (action) el.append(action); // например, форма «Отменить»
   toastBox.append(el);
   if (!reduce) animate(el, { opacity: [0, 1], y: [16, 0], scale: [0.98, 1] }, { duration: 0.35, ease: EASE });
-  setTimeout(async () => {
+  let left = action ? 9000 : 4500;
+  let started = Date.now();
+  let timer = 0;
+  const close = async () => {
+    clearTimeout(timer);
+    if (!el.isConnected) return;
     if (!reduce) await animate(el, { opacity: 0, y: 8 }, { duration: 0.25, ease: "easeIn" });
     el.remove();
-  }, action ? 9000 : 4500);
+  };
+  const run = () => { started = Date.now(); timer = setTimeout(close, left); };
+  const pause = () => { clearTimeout(timer); left -= Date.now() - started; };
+  // Пока палец/курсор/фокус на уведомлении — оно не исчезает; нажатие мимо кнопки — закрывает.
+  el.addEventListener("pointerenter", pause);
+  el.addEventListener("pointerleave", run);
+  el.addEventListener("focusin", pause);
+  el.addEventListener("focusout", run);
+  el.addEventListener("click", (e) => { if (!e.target.closest("form, button, a")) close(); });
+  run();
 }
 
 function flashToToast() {
@@ -143,13 +166,31 @@ addEventListener("pageshow", (e) => {
 });
 
 // ---------- Копирование ----------
+async function copyFrom(url) {
+  const text = () => fetch(url, { cache: "no-store" }).then((r) => {
+    if (!r.ok) throw new Error(String(r.status));
+    return r.text();
+  });
+  // ClipboardItem с обещанием сохраняет «жест пользователя» в Safari, пока текст загружается.
+  if (window.ClipboardItem && navigator.clipboard?.write) {
+    try {
+      const blob = text().then((t) => new Blob([t], { type: "text/plain" }));
+      await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
+      return;
+    } catch {
+      // ниже — запасной путь
+    }
+  }
+  await navigator.clipboard.writeText(await text());
+}
+
 document.addEventListener("click", async (e) => {
-  const btn = e.target.closest("[data-copy]");
+  const btn = e.target.closest("[data-copy-url]");
   if (!btn) return;
   const label = btn.querySelector("span") || btn;
   const before = label.textContent;
   try {
-    await navigator.clipboard.writeText(document.getElementById(btn.dataset.copy).value);
+    await copyFrom(btn.dataset.copyUrl);
     label.textContent = "Скопировано";
     if (!reduce) animate(btn, { scale: [0.96, 1] }, { duration: 0.35, ease: SPRING });
   } catch {
@@ -183,6 +224,7 @@ function setupDrop(drop) {
       const li = document.createElement("li");
       const name = document.createElement("span");
       name.className = "name";
+      name.dir = "auto";
       name.textContent = f.name;
       const size = document.createElement("span");
       size.className = "size";
@@ -236,6 +278,36 @@ function plural(n, one, few, many) {
   return many;
 }
 
+// Обновление куска страницы не должно выбрасывать фокус клавиатуры на начало страницы.
+function rememberFocus(box) {
+  const el = document.activeElement;
+  if (!el || !box.contains(el) || el === box) return null;
+  const card = el.closest("[data-job], .book-card");
+  return {
+    job: card?.dataset.job,
+    title: card?.dataset.title,
+    action: el.closest("form")?.getAttribute("action"),
+    href: el.getAttribute("href"),
+    filter: el.matches("[data-filter]") ? el.value : null,
+  };
+}
+
+function restoreFocus(box, f) {
+  if (!f) return;
+  let target = null;
+  if (f.filter != null) {
+    target = box.querySelector("[data-filter]");
+    if (target) target.value = f.filter;
+  } else {
+    const scope = (f.job && box.querySelector(`[data-job="${CSS.escape(f.job)}"]`))
+      || (f.title && box.querySelector(`.book-card[data-title="${CSS.escape(f.title)}"]`)) || box;
+    target = (f.action && scope.querySelector(`form[action="${CSS.escape(f.action)}"] button`))
+      || (f.href && scope.querySelector(`a[href="${CSS.escape(f.href)}"]`))
+      || scope.querySelector("button, a, input");
+  }
+  target?.focus({ preventScroll: true });
+}
+
 function setupLive(root) {
   const queueBox = root.querySelector("[data-live-queue]");
   const libBox = root.querySelector("[data-live-library]");
@@ -255,13 +327,13 @@ function setupLive(root) {
 
   const schedule = (ms) => {
     clearTimeout(timer);
-    timer = setTimeout(tick, ms ?? (active || busy ? 3000 : 20000));
+    timer = setTimeout(tick, ms ?? (active || busy ? 3000 : 30000));
   };
 
   async function tick() {
     if (document.hidden) return; // продолжим, когда вкладку откроют
     try {
-      const r = await fetch(`/live?lib=${encodeURIComponent(libVersion)}`, {
+      const r = await fetch(`/live?v=${encodeURIComponent(version)}&lib=${encodeURIComponent(libVersion)}`, {
         cache: "no-store",
         headers: { Accept: "application/json" },
       });
@@ -273,9 +345,11 @@ function setupLive(root) {
       if (r.ok) {
         setOffline(false);
         const d = await r.json();
-        if (d.version !== version) {
+        if (d.version !== version && d.queue != null) {
           const before = new Set([...queueBox.querySelectorAll("[data-job]")].map((el) => el.dataset.job));
+          const focus = rememberFocus(queueBox);
           queueBox.innerHTML = d.queue;
+          restoreFocus(queueBox, focus);
           queueBox.querySelectorAll("[data-stagger]").forEach((l) => l.removeAttribute("data-stagger"));
           const fresh = [...queueBox.querySelectorAll("[data-job]")].filter((el) => !before.has(el.dataset.job));
           if (fresh.length && !reduce) animate(fresh, { opacity: [0, 1], y: [8, 0] }, { delay: stagger(0.05), duration: 0.35, ease: EASE });
@@ -283,7 +357,9 @@ function setupLive(root) {
         }
         if (d.library != null) {
           const before = new Set([...libBox.querySelectorAll(".book-card")].map((el) => el.dataset.title));
+          const focus = rememberFocus(libBox);
           libBox.innerHTML = d.library;
+          restoreFocus(libBox, focus);
           libBox.querySelectorAll("[data-stagger]").forEach((l) => l.removeAttribute("data-stagger"));
           const fresh = [...libBox.querySelectorAll(".book-card")].filter((el) => !before.has(el.dataset.title));
           if (fresh.length && !reduce) {
@@ -351,15 +427,22 @@ function setupScene(scene) {
   let userPaused = false;
   let visible = false;
 
+  const setText = (el, value) => {
+    if (el.textContent !== value) el.textContent = value; // лишняя запись текста — лишний пересчёт раскладки
+  };
+  let currentStep = -1;
   const frame = () => {
     const t = ((controls.time % total) + total) % total;
-    type.textContent = t < 1.0 ? TYPES[Math.floor(t / 0.2) % TYPES.length] : "EPUB";
-    coreLabel.textContent = t >= 1.3 && t < 3.2 ? "Gemini читает…" : "Gemini";
+    setText(type, t < 1.0 ? TYPES[Math.floor(t / 0.2) % TYPES.length] : "EPUB");
+    setText(coreLabel, t >= 1.3 && t < 3.2 ? "Gemini читает…" : "Gemini");
     const k = clamp((t - 4.2) / 1.0, 0, 1);
-    count.textContent = `${Math.round(300 - 200 * (1 - (1 - k) ** 3))} стр.`;
-    fileText.textContent = FILE.slice(0, Math.round(clamp((t - 5.1) / 1.4, 0, 1) * FILE.length));
-    const current = t < 1.2 ? 0 : t < 3.2 ? 1 : 2;
-    steps.forEach((s, i) => s.classList.toggle("is-active", i === current));
+    setText(count, `${Math.round(300 - 200 * (1 - (1 - k) ** 3))} стр.`);
+    setText(fileText, FILE.slice(0, Math.round(clamp((t - 5.1) / 1.4, 0, 1) * FILE.length)));
+    const step = t < 1.2 ? 0 : t < 3.2 ? 1 : 2;
+    if (step !== currentStep) {
+      currentStep = step;
+      steps.forEach((s, i) => s.classList.toggle("is-active", i === step));
+    }
     raf = requestAnimationFrame(frame);
   };
 
@@ -376,6 +459,7 @@ function setupScene(scene) {
     cancelAnimationFrame(raf);
     raf = 0;
     scene.classList.remove("is-playing");
+    how?.classList.remove("is-playing"); // шаги снова полной яркости
   };
 
   playBtn.addEventListener("click", () => {

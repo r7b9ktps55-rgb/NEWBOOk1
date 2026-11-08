@@ -86,6 +86,21 @@ SAFE_ATTRS = {"a": {"href", "title"}, "abbr": {"title"}, "th": {"align"}, "td": 
 SAFE_CLASSES = {"span": {"wikilink", "callout"}, "a": {"footnote-ref", "footnote-backref"}, "div": {"footnote"}}
 
 
+_render_cache: dict[tuple[str, int, int], tuple[str, str]] = {}
+
+
+def render_note_cached(path: Path, text: str) -> tuple[str, str]:
+    """Отрисованная заметка кэшируется до изменения файла (ключ — путь, mtime и размер)."""
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    hit = _render_cache.get(key)
+    if hit is None:
+        if len(_render_cache) > 64:
+            _render_cache.clear()
+        hit = _render_cache[key] = render_note(text)
+    return hit
+
+
 def render_note(text: str) -> tuple[str, str]:
     """Возвращает (frontmatter, html). Сырой HTML из заметки не пропускаем."""
     front = ""
@@ -264,11 +279,19 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         resp.headers["Content-Security-Policy"] = CSP
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "same-origin"
-        if request.url.path.startswith("/static/") and resp.status_code == 200:
-            # Стили и скрипты подключаются с ?v=<версия>, поэтому их можно кэшировать надолго.
-            resp.headers["Cache-Control"] = "public, max-age=604800"
-        elif "cache-control" not in resp.headers:
+        path = request.url.path
+        if path.startswith("/static/") and resp.status_code == 200:
+            if "v" in request.query_params or path.startswith("/static/vendor/"):
+                # Версия в адресе (?v=… или в имени файла) — содержимое по этому адресу не меняется никогда.
+                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            else:
+                resp.headers["Cache-Control"] = "public, max-age=604800"
+        elif path == "/live":
             resp.headers["Cache-Control"] = "no-store"
+        elif "cache-control" not in resp.headers:
+            # no-cache, а не no-store: браузер может вернуть страницу кнопкой «Назад» мгновенно (bfcache),
+            # но каждый новый показ всё равно сверяет её с сервером.
+            resp.headers["Cache-Control"] = "no-cache"
         return resp
 
     ERROR_TITLES = {400: "Неверный запрос", 403: "Доступ запрещён", 404: "Не найдено", 405: "Так нельзя",
@@ -410,11 +433,15 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         })
 
     @app.get("/live")
-    async def live(lib: str = "", _: str = Depends(auth)):
-        """Состояние очереди для обновления страницы без перезагрузки."""
+    async def live(v: str = "", lib: str = "", _: str = Depends(auth)):
+        """Состояние очереди для обновления страницы без перезагрузки.
+
+        Клиент присылает версии того, что у него уже есть; неизменившиеся куски не пересылаются."""
         await asyncio.to_thread(proc.sync_inbox)
         state = await asyncio.to_thread(page_state)
-        queue_html = templates.env.get_template("_queue.html").render(state)
+        queue_html = None
+        if v != state["version"]:
+            queue_html = templates.env.get_template("_queue.html").render(state)
         library_html = None
         if lib != state["lib_version"]:
             library_html = templates.env.get_template("_library.html").render(state)
@@ -503,7 +530,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     async def view_note(request: Request, name: str, _: str = Depends(auth)):
         path = note_path(name)
         text = path.read_text("utf-8")
-        front, html = render_note(text)
+        front, html = render_note_cached(path, text)
         file_in_vault = path.relative_to(s.vault.resolve()).with_suffix("").as_posix()
         params = {"file": file_in_vault, "content": text}
         if s.obsidian_vault_name:
@@ -517,7 +544,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             "author": meta.get("author", ""),
             "format_label": fmt.label if fmt else "Заметка",
             "props": note_props(meta),
-            "name": path.name, "front": front, "html": html, "raw": text,
+            "name": path.name, "front": front, "html": html,
             "obsidian_uri": uri if len(uri) <= OBSIDIAN_URI_LIMIT else "",
             "book": book, "formats": FORMATS, "has_key": summarizer is not None,
         })

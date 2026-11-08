@@ -1,10 +1,14 @@
 {% from "_icons.html" import icon %}
 <div class="section-head">
   <h2 class="h2" id="queue-title">Очередь <span class="count">{{ active|length }}</span></h2>
+  {% if busy %}
+  <p class="busy-note" role="status"><span class="spinner" aria-hidden="true"></span>Идёт разбор — очередь обновляется сама</p>
+  {% else %}
   <form action="/run" method="post" class="run" data-busy-form>
-    <button class="btn primary" {% if busy or not has_key or not active %}disabled{% endif %}>{% if busy %}Обрабатываю…{% else %}Разобрать 1{% endif %}</button>
-    <button class="btn ghost" name="all" value="1" {% if busy or not has_key or not active %}disabled{% endif %}>Всю очередь</button>
+    <button class="btn primary" {% if not has_key or not active %}disabled{% endif %}>Разобрать 1</button>
+    <button class="btn ghost" name="all" value="1" {% if not has_key or not active %}disabled{% endif %}>Всю очередь</button>
   </form>
+  {% endif %}
 </div>
 {% if limit_reached %}<p class="flash warn">Дневной лимит запросов к Gemini исчерпан ({{ requests_today }} из {{ s.daily_request_limit }}). Очередь продолжит разбираться завтра.</p>{% endif %}
 {% if git.last_error %}<p class="flash warn">Git: {{ git.last_error }}</p>{% endif %}
@@ -20,7 +24,7 @@
   <li class="job" data-job="{{ j.id }}">
     <div class="job-row">
       <span class="job-type">{{ j.type_label }}</span>
-      <span class="job-title" title="{{ j.source }}">{{ j.title }}</span>
+      <span class="job-title" dir="auto" title="{{ j.source }}">{{ j.title }}</span>
       <span class="pill {{ j.status }}">{{ {'queued': 'в очереди', 'processing': 'в работе', 'error': 'ошибка'}[j.status] }}</span>
       {% if j.status != 'processing' %}
       <span class="job-actions">

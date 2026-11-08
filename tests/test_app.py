@@ -632,8 +632,8 @@ def test_live_endpoint_updates_without_reload(tmp_path):
     first = client.get("/live", auth=AUTH).json()
     assert first["active"] == 0 and first["notes"] == 0 and "Очередь пуста" in first["queue"]
     assert first["library"] is not None  # версия библиотеки не передана — отдаём её целиком
-    same = client.get(f"/live?lib={first['lib_version']}", auth=AUTH).json()
-    assert same["library"] is None and same["version"] == first["version"]  # ничего не изменилось
+    same = client.get(f"/live?v={first['version']}&lib={first['lib_version']}", auth=AUTH).json()
+    assert same["library"] is None and same["queue"] is None and same["version"] == first["version"]  # ничего не изменилось
     upload(client, "a.pdf", formats=["summary", "quotes"])
     queued = client.get(f"/live?lib={first['lib_version']}", auth=AUTH).json()
     assert queued["version"] != first["version"] and queued["active"] == 1 and 'data-job="1"' in queued["queue"]
@@ -661,9 +661,9 @@ def test_note_page_shows_properties(tmp_path):
     upload(client, "Книга.pdf", formats=["x3"])
     run_queue(app)
     page = client.get("/notes/Книга - Автор (сжатие x3).md", auth=AUTH).text
-    assert '<span class="caps">Сжатие ×3</span>' in page
+    assert '<mark class="marker" data-draw>Сжатие ×3</mark>' in page and '<h1 dir="auto">Книга</h1>' in page
     assert '<dt>Источник</dt><dd>Книга.pdf</dd>' in page and '<dt>Статус</dt><dd>не прочитано</dd>' in page
-    assert '<p class="byline">Автор</p>' in page
+    assert '<p class="byline" dir="auto">Автор</p>' in page
 
 
 def test_flash_messages_have_kind(tmp_path):
@@ -675,12 +675,15 @@ def test_flash_messages_have_kind(tmp_path):
 
 def test_static_assets_cached_and_compressed(tmp_path):
     client, _, _ = make(tmp_path)
-    r = client.get("/static/vendor/motion.min.js", headers={"Accept-Encoding": "gzip"})
+    r = client.get("/static/vendor/motion-14.6.0.min.js", headers={"Accept-Encoding": "gzip"})
     assert r.status_code == 200 and r.headers["content-encoding"] == "gzip"
-    assert "max-age=604800" in r.headers["cache-control"]
+    assert "max-age=604800" in client.get("/static/fonts/mulish-cyrillic-wght-normal.woff2").headers["cache-control"]
     font = client.get("/static/fonts/mulish-cyrillic-wght-normal.woff2")
     assert font.status_code == 200 and font.content[:4] == b"wOF2"
-    assert client.get("/", auth=AUTH).headers["cache-control"] == "no-store"
+    assert client.get("/", auth=AUTH).headers["cache-control"] == "no-cache"  # кэш «назад/вперёд» разрешён
+    assert client.get("/live", auth=AUTH).headers["cache-control"] == "no-store"
+    assert "immutable" in client.get("/static/style.css?v=1").headers["cache-control"]
+    assert "immutable" in client.get("/static/vendor/motion-14.6.0.min.js").headers["cache-control"]
     assert client.get("/static/favicon.svg").status_code == 200
 
 
@@ -1165,3 +1168,17 @@ def test_manifest_and_icons_are_public(tmp_path):
         r = client.get(icon["src"])
         assert r.status_code == 200 and r.content[:8] == b"\x89PNG\r\n\x1a\n"
     assert 'rel="manifest"' in client.get("/", auth=AUTH).text
+
+
+
+def test_note_page_copy_without_hidden_copy_and_render_cache(tmp_path):
+    from bookhub import main as m
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf")
+    run_queue(app)
+    page = client.get("/notes/a - Автор.md", auth=AUTH).text
+    assert 'data-copy-url="/notes/a%20-%20%D0%90%D0%B2%D1%82%D0%BE%D1%80.md/download"' in page and "<textarea" not in page
+    assert any(k[0].endswith("a - Автор.md") for k in m._render_cache)
+    note = s.books_dir / "a - Автор.md"
+    note.write_text(note.read_text("utf-8") + "\nНовая строка про изменения\n", "utf-8")
+    assert "Новая строка про изменения" in client.get("/notes/a - Автор.md", auth=AUTH).text  # кэш сбросился
