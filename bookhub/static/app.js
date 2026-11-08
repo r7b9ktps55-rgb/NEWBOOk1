@@ -68,14 +68,26 @@ function toast(text, kind = "ok", action = null) {
   let left = action ? 9000 : 4500;
   let started = Date.now();
   let timer = 0;
+  let paused = false;
   const close = async () => {
     clearTimeout(timer);
     if (!el.isConnected) return;
     if (!reduce) await animate(el, { opacity: 0, y: 8 }, { duration: 0.25, ease: "easeIn" });
     el.remove();
   };
-  const run = () => { started = Date.now(); timer = setTimeout(close, left); };
-  const pause = () => { clearTimeout(timer); left -= Date.now() - started; };
+  const run = () => {
+    if (!paused && timer) return; // уже идёт
+    paused = false;
+    clearTimeout(timer);
+    started = Date.now();
+    timer = setTimeout(close, Math.max(left, 800));
+  };
+  const pause = () => {
+    if (paused) return; // указатель и фокус одновременно — вычитаем время один раз
+    paused = true;
+    clearTimeout(timer);
+    left -= Date.now() - started;
+  };
   // Пока палец/курсор/фокус на уведомлении — оно не исчезает; нажатие мимо кнопки — закрывает.
   el.addEventListener("pointerenter", pause);
   el.addEventListener("pointerleave", run);
@@ -86,9 +98,12 @@ function toast(text, kind = "ok", action = null) {
   // Обновить текст уже показанного уведомления и продлить его жизнь
   el.update = (newText) => {
     span.textContent = newText;
-    clearTimeout(timer);
     left = action ? 9000 : 4500;
-    run();
+    if (!paused) {
+      clearTimeout(timer);
+      started = Date.now();
+      timer = setTimeout(close, left);
+    }
   };
   return el;
 }
@@ -116,7 +131,7 @@ function uploadWithProgress(form, submitter) {
   const label = box.querySelector("span");
   const fill = box.querySelector(".fill");
   const buttons = [...form.querySelectorAll("button")];
-  buttons.forEach((b) => (b.disabled = true));
+  buttons.forEach((b) => { b.disabled = true; b.dataset.autoDisabled = "1"; });
   const fail = (text) => {
     box.remove();
     buttons.forEach((b) => (b.disabled = false));
@@ -169,16 +184,33 @@ addEventListener("pageshow", (e) => {
   document.querySelectorAll("[data-auto-disabled]").forEach((b) => {
     b.disabled = false;
     delete b.dataset.autoDisabled;
-    b.querySelector(".spinner")?.remove();
   });
+  document.querySelectorAll("form .spinner, .upload-progress").forEach((el) => el.remove());
 });
 
 // ---------- Копирование ----------
+function copyViaSelection(text) {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.className = "visually-hidden";
+  document.body.append(area);
+  area.select();
+  const ok = document.execCommand("copy");
+  area.remove();
+  if (!ok) throw new Error("copy");
+}
+
 async function copyFrom(url) {
   const text = () => fetch(url, { cache: "no-store" }).then((r) => {
     if (!r.ok) throw new Error(String(r.status));
     return r.text();
   });
+  if (!window.isSecureContext || !navigator.clipboard) {
+    // Сайт открыт по http:// в локальной сети: современный буфер обмена браузер не даёт.
+    copyViaSelection(await text());
+    return;
+  }
   // ClipboardItem с обещанием сохраняет «жест пользователя» в Safari, пока текст загружается.
   if (window.ClipboardItem && navigator.clipboard?.write) {
     try {
@@ -262,9 +294,12 @@ function setupDrop(drop) {
 }
 
 // ---------- Поиск по библиотеке ----------
+let filterQuery = "";
+
 function applyFilter() {
   const input = document.querySelector("[data-filter]");
-  const q = (input?.value || "").trim().toLowerCase();
+  if (input && input.value !== filterQuery) input.value = filterQuery; // поле могло пересоздаться
+  const q = filterQuery.trim().toLowerCase();
   let shown = 0;
   document.querySelectorAll(".book-card").forEach((card) => {
     const hit = !q || card.dataset.title.includes(q);
@@ -275,7 +310,10 @@ function applyFilter() {
   if (empty) empty.hidden = shown > 0;
 }
 document.addEventListener("input", (e) => {
-  if (e.target.matches("[data-filter]")) applyFilter();
+  if (e.target.matches("[data-filter]")) {
+    filterQuery = e.target.value;
+    applyFilter();
+  }
 });
 
 // ---------- Живая очередь: обновление без перезагрузки ----------
@@ -346,6 +384,7 @@ function setupLive(root) {
       const r = await fetch(`/live?v=${encodeURIComponent(version)}&lib=${encodeURIComponent(libVersion)}`, {
         cache: "no-store",
         headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
       });
       if (r.status === 401) {
         setOffline(true, "Нужно войти заново — обновите страницу.");

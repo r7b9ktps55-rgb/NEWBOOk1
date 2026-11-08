@@ -78,26 +78,41 @@ def prune(s: Settings) -> None:
         old.unlink(missing_ok=True)
 
 
-def restore(s: Settings, archive: Path, force: bool = False) -> None:
-    """Распаковывает копию в папку данных. Без --force — только в пустую папку."""
-    if s.db_path.exists() and not force:
-        raise ConfigError(f"В {s.data_dir} уже есть данные. Остановите сайт и добавьте --force, чтобы заменить их.")
-    s.data_dir.mkdir(parents=True, exist_ok=True)
-    # Распаковываем внутрь папки данных: в контейнере писать можно только туда.
-    stage = s.data_dir / ".restore-tmp"
-    shutil.rmtree(stage, ignore_errors=True)
+def _has_data(path: Path) -> bool:
+    return path.is_file() or (path.is_dir() and any(path.iterdir()))
+
+
+def restore(s: Settings, archive: Path, force: bool = False) -> Path | None:
+    """Распаковывает копию в папку данных.
+
+    Без --force — только если всё, что есть в копии, на месте пусто. С --force текущие данные не стираются,
+    а переносятся в data/.pre-restore-<время>; путь к ним возвращается."""
     with tarfile.open(archive, "r:gz") as tar:
         members = [m for m in tar.getmembers() if m.name.startswith("data/")]
+        names = sorted({Path(m.name).parts[1] for m in members if len(Path(m.name).parts) > 1})
+        busy = [n for n in names if _has_data(s.data_dir / n)]
+        if busy and not force:
+            raise ConfigError(
+                f"В {s.data_dir} уже есть данные ({', '.join(busy)}). Остановите сайт и добавьте --force: "
+                "текущие данные будут перенесены в папку .pre-restore-…, а не удалены."
+            )
+        s.data_dir.mkdir(parents=True, exist_ok=True)
+        # Распаковываем внутрь папки данных: в контейнере писать можно только туда.
+        stage = s.data_dir / ".restore-tmp"
+        shutil.rmtree(stage, ignore_errors=True)
         tar.extractall(stage, members=members, filter="data")  # filter="data" не пускает пути за пределы папки
+    kept = None
     for item in (stage / "data").iterdir():
         dest = s.data_dir / item.name
-        if dest.is_dir() and not dest.is_symlink():
-            shutil.rmtree(dest)
-        elif dest.exists():
-            dest.unlink()
+        if dest.exists() or dest.is_symlink():
+            if kept is None:
+                kept = s.data_dir / f".pre-restore-{datetime.now(s.tz).strftime('%Y-%m-%d_%H%M%S')}"
+                kept.mkdir()
+            shutil.move(str(dest), kept / item.name)
         shutil.move(str(item), dest)
     shutil.rmtree(stage, ignore_errors=True)
-    log.info("Данные восстановлены из %s", archive.name)
+    log.info("Данные восстановлены из %s%s", archive.name, f"; прежние сохранены в {kept.name}" if kept else "")
+    return kept
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,7 +134,9 @@ def main(argv: list[str] | None = None) -> int:
             for p in list_backups(s):
                 print(f"{p.name}\t{p.stat().st_size / 1024 / 1024:.1f} МБ")
         else:
-            restore(s, args.file, force=args.force)
+            kept = restore(s, args.file, force=args.force)
+            if kept:
+                print(f"Прежние данные сохранены в {kept}")
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 1

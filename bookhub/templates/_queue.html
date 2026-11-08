@@ -38,6 +38,7 @@
     <div class="tags">
       {% for f in j.format_list if f in formats %}<span class="tag {% if f in j.done_list %}done{% endif %}">{% if f in j.done_list %}{{ icon("check") }}{% endif %}{{ formats[f].label }}</span>{% endfor %}
     </div>
+    {% if j.progress and j.status == 'queued' %}<p class="hint">{{ j.progress }}</p>{% endif %}
     {% if j.status == 'processing' %}
     <div class="job-progress"><p>{{ j.progress or "Начинаю" }}…</p><div class="bar"></div></div>
     {% endif %}

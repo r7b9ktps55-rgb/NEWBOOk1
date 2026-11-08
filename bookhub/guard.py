@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import logging
@@ -11,19 +12,36 @@ import time
 from collections import deque
 from html import escape
 
+from fastapi.exceptions import HTTPException
+
 log = logging.getLogger(__name__)
 
 PUBLIC_PATHS = {"/health"}
 PUBLIC_PREFIXES = ("/static/",)
 
 
-class LoginLimiter:
-    """Не больше `attempts` неудачных входов с одного адреса за `window` секунд."""
+class BodyTooLarge(HTTPException):
+    """Тело запроса без Content-Length оказалось больше лимита.
 
-    def __init__(self, attempts: int = 10, window: float = 600, clock=time.monotonic):
+    Наследник HTTPException: FastAPI пропускает такие ошибки при разборе формы как есть (с кодом 413),
+    а любые другие превращает в 400."""
+
+    def __init__(self) -> None:
+        super().__init__(413, "Слишком большой запрос")
+
+
+class LoginLimiter:
+    """Не больше `attempts` неудачных входов с одного адреса за `window` секунд.
+
+    Неудачи истекают только по времени: успешный вход с того же адреса их не обнуляет, иначе
+    открытая вкладка владельца (она опрашивает сервер) сбрасывала бы счётчик подбирающему пароль.
+    Каждая неудачная попытка ещё и отвечает с паузой `fail_delay`."""
+
+    def __init__(self, attempts: int = 10, window: float = 600, clock=time.monotonic, fail_delay: float = 1.0):
         self.attempts = attempts
         self.window = window
         self.clock = clock
+        self.fail_delay = fail_delay
         self._fails: dict[str, deque] = {}
 
     def _recent(self, ip: str) -> deque | None:
@@ -48,7 +66,7 @@ class LoginLimiter:
         self._fails.setdefault(ip, deque()).append(self.clock())
 
     def success(self, ip: str) -> None:
-        self._fails.pop(ip, None)
+        """Ничего не обнуляет: неудачи истекают по окну времени (см. описание класса)."""
 
 
 def check_basic(header: bytes | None, user: str, password: str) -> bool | None:
@@ -92,19 +110,39 @@ class GuardMiddleware:
             if ok is False:
                 self.limiter.fail(ip)
                 log.warning("Неудачная попытка входа с адреса %s", ip)
+                if self.limiter.fail_delay:
+                    await asyncio.sleep(self.limiter.fail_delay)  # замедляем подбор пароля
             return await reply(send, 401, "Нужны логин и пароль.",
                                [(b"www-authenticate", b'Basic realm="Book Hub", charset="UTF-8"')])
         self.limiter.success(ip)
         if scope.get("method") in ("POST", "PUT", "PATCH"):
-            raw = headers.get(b"content-length", b"0")
-            try:
-                size = int(raw)
-            except ValueError:
-                return await reply(send, 400, "Неверный заголовок Content-Length.")
-            if size > self.max_body:
-                mb = self.max_body // (1024 * 1024)
-                return await reply(send, 413, f"Слишком большой запрос: больше {mb} МБ за один раз.")
+            raw = headers.get(b"content-length")
+            if raw is None:
+                # Тело без длины (chunked): считаем байты по мере чтения и прерываем на лимите.
+                receive = self._limited(receive)
+            else:
+                try:
+                    size = int(raw)
+                except ValueError:
+                    return await reply(send, 400, "Неверный заголовок Content-Length.")
+                if size > self.max_body:
+                    mb = self.max_body // (1024 * 1024)
+                    return await reply(send, 413, f"Слишком большой запрос: больше {mb} МБ за один раз.")
         await self.app(scope, receive, send)
+
+    def _limited(self, receive):
+        total = 0
+
+        async def wrapped():
+            nonlocal total
+            message = await receive()
+            if message.get("type") == "http.request":
+                total += len(message.get("body", b""))
+                if total > self.max_body:
+                    raise BodyTooLarge()
+            return message
+
+        return wrapped
 
 
 async def reply(send, status: int, text: str, extra: list[tuple[bytes, bytes]] | None = None) -> None:

@@ -39,6 +39,10 @@ class DailyLimitReached(SummaryError):
     """Дневной лимит запросов к Gemini исчерпан — задача вернётся в очередь."""
 
 
+class NotEnoughToday(DailyLimitReached):
+    """Остатка дневного лимита не хватит на всю книгу: отложить без трат и взять следующую."""
+
+
 @dataclass
 class Summary:
     fmt: str
@@ -116,10 +120,23 @@ def with_frontmatter(markdown: str, meta: dict) -> str:
     return f"---\n{front}\n---\n\n{body.lstrip()}"
 
 
+def _pieces(para: str, chunk_words: int) -> list[str]:
+    """Слишком длинный абзац делится по предложениям, а если и они длинные — по словам."""
+    if len(para.split()) <= chunk_words:
+        return [para]
+    out = []
+    for sentence in re.split(r"(?<=[.!?…])\s+|\n", para):
+        words = sentence.split()
+        for i in range(0, len(words), chunk_words):
+            out.append(" ".join(words[i:i + chunk_words]))
+    return out
+
+
 def split_text(text: str, chunk_words: int = CHUNK_WORDS) -> list[str]:
     """Режет текст по абзацам на куски примерно по chunk_words слов."""
     chunks, cur, n = [], [], 0
-    for para in re.split(r"\n\s*\n", text):
+    paragraphs = [piece for para in re.split(r"\n\s*\n", text) for piece in _pieces(para, chunk_words)]
+    for para in paragraphs:
         w = len(para.split())
         if cur and n + w > chunk_words:
             chunks.append("\n\n".join(cur))
@@ -168,6 +185,7 @@ class GeminiSummarizer:
         self.sleep = sleep
         self.max_requests = max_requests  # потолок запросов на одну книгу (0 — без потолка)
         self.meter = meter  # вызывается перед каждым запросом; бросает DailyLimitReached
+        self.plan_check: Callable[[int], None] | None = None  # проверка плана до первого запроса
 
     # ----- промпты -----
     def prompt(self, fmt: str) -> str:
@@ -194,12 +212,14 @@ class GeminiSummarizer:
                     continue
                 raise
         text = getattr(res, "text", None)
+        reason = ""
+        try:
+            reason = str(res.candidates[0].finish_reason or "")
+        except Exception:
+            pass
+        if "MAX_TOKENS" in reason:
+            raise SummaryError("Ответ модели обрезан по длине (MAX_TOKENS) — заметка была бы неполной")
         if not text:
-            reason = ""
-            try:
-                reason = str(res.candidates[0].finish_reason)
-            except Exception:
-                pass
             raise SummaryError(f"Модель вернула пустой ответ {reason}".strip())
         return text
 
@@ -257,6 +277,8 @@ class GeminiSummarizer:
                 f"Для этой книги нужно {planned} запросов к Gemini — больше лимита {self.max_requests} "
                 "на одну книгу (MAX_REQUESTS_PER_JOB). Уберите сжатие или увеличьте лимит."
             )
+        if self.plan_check:
+            self.plan_check(planned)  # хватит ли сегодняшнего лимита на всю книгу
 
         if whole:
             up = None

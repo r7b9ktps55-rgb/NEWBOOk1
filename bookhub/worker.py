@@ -20,7 +20,8 @@ from .formats import FORMATS
 from .gitsync import GitSync
 from .notify import Notifier
 from .store import Job, JobStore
-from .summarizer import MAX_NAME_BYTES, DailyLimitReached, Summarizer, Summary, SummaryError, safe_filename, with_frontmatter
+from .summarizer import (MAX_NAME_BYTES, DailyLimitReached, NotEnoughToday, Summarizer, Summary, SummaryError,
+                         safe_filename, with_frontmatter)
 from .trash import Trash
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,20 @@ class Processor:
     def today(self) -> str:
         return datetime.now(self.s.tz).strftime("%Y-%m-%d")
 
+    def check_plan(self, planned: int) -> None:
+        """До первого запроса к Gemini: хватит ли дневного лимита на всю книгу."""
+        limit = self.s.daily_request_limit
+        if not limit:
+            return
+        if planned > limit:
+            raise SummaryError(
+                f"Для этой книги нужно {planned} запросов к Gemini — больше дневного лимита {limit} "
+                "(DAILY_REQUEST_LIMIT). Увеличьте лимит или уберите сжатие."
+            )
+        left = limit - self.store.requests_on(self.today())
+        if planned > left:
+            raise NotEnoughToday(f"Сегодня осталось {max(0, left)} запросов к Gemini, а книге нужно {planned}")
+
     def take_request(self) -> None:
         """Счётчик запросов к Gemini: вызывается перед каждым запросом."""
         if not self.store.take_request(self.today(), self.s.daily_request_limit):
@@ -98,19 +113,43 @@ class Processor:
         added = 0
         with self.inbox_lock:
             for p in sorted(self.s.inbox.iterdir()):
-                stem, ext = split_name(p.name)
-                if not p.is_file() or not ext or p.name.startswith("."):
-                    continue
-                if self.store.active_file(p.name):
-                    continue  # это файл задачи, которая ещё ждёт очереди
-                if self.store.has_file(p.name):
-                    # Имя уже было у другой книги — переименовываем, чтобы не перепутать их.
-                    new = self.free_inbox_name(stem, ext)
-                    p.rename(new)
-                    p, stem = new, split_name(new.name)[0]
-                self.store.add("file", p.name, stem, list(self.s.default_formats))
-                added += 1
+                try:
+                    p = self._utf8_name(p)
+                    stem, ext = split_name(p.name)
+                    if not p.is_file() or not ext or p.name.startswith("."):
+                        continue
+                    if self.store.active_file(p.name):
+                        continue  # это файл задачи, которая ещё ждёт очереди
+                    if self.store.has_file(p.name):
+                        # Имя уже было у другой книги — переименовываем, чтобы не перепутать их.
+                        new = self.free_inbox_name(stem, ext)
+                        p.rename(new)
+                        p, stem = new, split_name(new.name)[0]
+                    self.store.add("file", p.name, stem, list(self.s.default_formats))
+                    added += 1
+                except Exception:  # один странный файл не должен ломать страницу и очередь
+                    log.exception("Не удалось поставить в очередь файл %r", p.name)
         return added
+
+    def _utf8_name(self, p: Path) -> Path:
+        """Имя не в UTF-8 (старый архив, диск с cp1251/cp866) переименовываем в читаемое."""
+        try:
+            p.name.encode("utf-8")
+            return p
+        except UnicodeEncodeError:
+            pass
+        raw = os.fsencode(p.name)
+        for encoding in ("cp1251", "cp866", "latin-1"):
+            try:
+                decoded = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        stem, ext = split_name(decoded)
+        new = self.free_inbox_name(safe_filename(stem, "book"), ext or Path(decoded).suffix.lower())
+        p.rename(new)
+        log.info("Файл с именем не в UTF-8 переименован в «%s»", new.name)
+        return new
 
     def find_file(self, name: str) -> Path | None:
         for folder in (self.s.inbox, self.s.archive):
@@ -129,12 +168,17 @@ class Processor:
             await asyncio.to_thread(self.sync_inbox)
             notes: list[str] = []
             attempts = 0
+            postponed: set[int] = set()  # книги, которым не хватило сегодняшнего лимита
             while (limit is None or attempts < limit) and not self.limit_hit:
-                job = self.store.claim_next()
+                job = self.store.claim_next(postponed)
                 if not job:
                     break
+                written, skipped = await asyncio.to_thread(self._process, job)
+                if skipped:
+                    postponed.add(job.id)  # без трат; пробуем следующую книгу
+                    continue
                 attempts += 1
-                notes += await asyncio.to_thread(self._process, job)
+                notes += written
             if notes:
                 msg = f"Add {notes[0]}" if len(notes) == 1 else f"Add {len(notes)} book notes"
                 had_error = self.git.last_error
@@ -146,6 +190,11 @@ class Processor:
         """Ежедневный разбор по расписанию: результат запоминается и приходит уведомлением."""
         errors_before = len(self.store.list("error"))
         started = datetime.now(self.s.tz)
+        if not self.summarizer:  # без ключа не трогаем очередь: книги не должны падать с ошибкой
+            self.store.set_meta("last_daily_run", json.dumps(
+                {"at": started.strftime("%Y-%m-%d %H:%M"), "result": "пропущен: не задан GEMINI_API_KEY"},
+                ensure_ascii=False))
+            return
         try:
             done = await self.run(self.s.daily_batch_size)
             errors = max(0, len(self.store.list("error")) - errors_before)
@@ -160,7 +209,8 @@ class Processor:
         if result != "готово заметок: 0":
             self.notifier.send(f"ежедневный разбор — {result}")
 
-    def _process(self, job: Job) -> list[str]:
+    def _process(self, job: Job) -> tuple[list[str], bool]:
+        """Возвращает (новые заметки, отложена ли книга без трат до завтра)."""
         written: list[str] = []
         try:
             if not self.summarizer:
@@ -191,6 +241,12 @@ class Processor:
                 written.append(note.stem)
             self.store.mark_done(job.id)
             log.info("Готово: %s -> %s", job.source, ", ".join(written))
+        except NotEnoughToday as exc:
+            # Ни одного запроса ещё не было: откладываем книгу, очередь идёт дальше.
+            self.store.requeue_now(job.id)
+            self.store.set_progress(job.id, f"{exc} — продолжу завтра")
+            log.info("%s — задача %s отложена до завтра", exc, job.id)
+            return written, True
         except DailyLimitReached as exc:
             # Не ошибка книги: вернём задачу в очередь, разбор продолжится завтра.
             self.limit_hit = True
@@ -205,7 +261,7 @@ class Processor:
             message = (str(exc) or exc.__class__.__name__) + done
             self.store.mark_error(job.id, message)
             self.notifier.send(f"не удалось обработать «{job.book or job.title}»: {message}")
-        return written
+        return written, False
 
     def _write(self, summary: Summary, source: str) -> Path:
         meta = {
@@ -225,17 +281,18 @@ class Processor:
         return note
 
     # ---------- обслуживание ----------
-    def maintenance(self) -> dict:
-        """Раз в сутки: резервная копия, очистка корзины и кэша DjVu, старые счётчики."""
+    def maintenance(self, with_backup: bool = True) -> dict:
+        """Раз в сутки: резервная копия (если включена), очистка корзины и кэша DjVu, старые счётчики."""
         from .backup import make_backup
 
         report: dict = {}
-        try:
-            report["backup"] = make_backup(self.s).name
-        except Exception as exc:
-            log.exception("Резервная копия не создана")
-            report["backup_error"] = str(exc)
-            self.notifier.send(f"резервная копия не создана: {exc}")
+        if with_backup:
+            try:
+                report["backup"] = make_backup(self.s).name
+            except Exception as exc:
+                log.exception("Резервная копия не создана")
+                report["backup_error"] = str(exc)
+                self.notifier.send(f"резервная копия не создана: {exc}")
         report["trash_purged"] = self.trash.purge(self.s.trash_days)
         report["cache_purged"] = self.clean_cache()
         self.store.prune_usage((datetime.now(self.s.tz) - timedelta(days=90)).strftime("%Y-%m-%d"))

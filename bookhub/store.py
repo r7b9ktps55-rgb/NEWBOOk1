@@ -197,12 +197,15 @@ class JobStore:
             return self._run(f"SELECT * FROM jobs WHERE status IN ({marks}) ORDER BY id", statuses)
         return self._run("SELECT * FROM jobs ORDER BY id")
 
-    def claim_next(self) -> Job | None:
-        """Берёт следующую задачу одним запросом — две копии приложения не возьмут одну и ту же."""
+    def claim_next(self, exclude: set[int] | frozenset = frozenset()) -> Job | None:
+        """Берёт следующую задачу одним запросом — две копии приложения не возьмут одну и ту же.
+
+        exclude — задачи, отложенные в этом проходе (например, им не хватило сегодняшнего лимита)."""
+        skip = ",".join(str(int(i)) for i in exclude) or "0"
         rows = self._run(
             "UPDATE jobs SET status='processing', error=NULL, progress=NULL, updated_at=? "
-            "WHERE id = (SELECT id FROM jobs WHERE status='queued' ORDER BY id LIMIT 1) AND status='queued' "
-            "RETURNING *",
+            f"WHERE id = (SELECT id FROM jobs WHERE status='queued' AND id NOT IN ({skip}) ORDER BY id LIMIT 1) "
+            "AND status='queued' RETURNING *",
             (_now(),),
         )
         return rows[0] if rows else None

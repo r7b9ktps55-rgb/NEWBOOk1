@@ -49,6 +49,7 @@ class FakeSummarizer:
 def make(tmp_path, summarizer=None, **kw):
     s = Settings(web_password="secret-pass-42", data_dir=tmp_path / "data", **kw)
     app = create_app(s, summarizer=summarizer, start_scheduler=False)
+    app.state.limiter.fail_delay = 0  # пауза после неверного пароля проверяется отдельным тестом
     return TestClient(app), s, app
 
 
@@ -1182,3 +1183,196 @@ def test_note_page_copy_without_hidden_copy_and_render_cache(tmp_path):
     note = s.books_dir / "a - Автор.md"
     note.write_text(note.read_text("utf-8") + "\nНовая строка про изменения\n", "utf-8")
     assert "Новая строка про изменения" in client.get("/notes/a - Автор.md", auth=AUTH).text  # кэш сбросился
+
+
+
+# ---------- исправления по независимой проверке кода ----------
+
+def test_cyrillic_login_and_password(tmp_path):
+    s = Settings(web_password="секретный-пароль", web_user="я", data_dir=tmp_path / "data")
+    app = create_app(s, start_scheduler=False)
+    client = TestClient(app)
+    import base64 as b64
+    good = {"Authorization": "Basic " + b64.b64encode("я:секретный-пароль".encode()).decode()}
+    assert client.get("/", headers=good).status_code == 200
+    assert client.get("/live", headers=good).status_code == 200
+    bad = {"Authorization": "Basic " + b64.b64encode("я:неверный".encode()).decode()}
+    assert client.get("/", headers=bad).status_code == 401
+
+
+def test_failed_login_is_slowed_and_not_reset_by_success(tmp_path):
+    import time as _time
+    client, s, app = make(tmp_path)
+    app.state.limiter.fail_delay = 0.2
+    started = _time.monotonic()
+    assert client.get("/", auth=("me", "wrong-password")).status_code == 401
+    assert _time.monotonic() - started >= 0.2
+    app.state.limiter.fail_delay = 0
+    for _ in range(9):
+        client.get("/", auth=("me", "wrong-password"))
+        client.get("/live", auth=AUTH)  # вкладка владельца продолжает опрашивать сервер
+    assert client.get("/", auth=AUTH).status_code == 429  # счётчик подбирающего не обнулился
+
+
+def _gemini_app(tmp_path, **kw):
+    holder = {}
+
+    def factory(api_key):
+        holder["c"] = FakeClient(api_key)
+        return holder["c"]
+
+    g = GeminiSummarizer("k", "m", tmp_path, client_factory=factory, sleep=lambda s: None)
+    client, s, app = make(tmp_path, g, **kw)
+    return client, s, app, holder
+
+
+def test_book_bigger_than_daily_limit_fails_without_spending(tmp_path):
+    client, s, app, holder = _gemini_app(tmp_path, daily_request_limit=3)
+    pdf = tmp_path / "big.pdf"
+    blank_pdf(pdf, 45)  # 1 конспект + 3 части сжатия = 4 запроса > 3
+    upload(client, "big.pdf", pdf.read_bytes(), formats=["summary", "x3"])
+    run_queue(app)
+    job = app.state.store.list()[0]
+    assert job.status == "error" and "больше дневного лимита 3" in job.error
+    assert holder["c"].requests == [] and app.state.store.requests_on(app.state.processor.today()) == 0
+
+
+def test_not_enough_left_today_postpones_and_takes_next_book(tmp_path):
+    client, s, app, holder = _gemini_app(tmp_path, daily_request_limit=10)
+    proc = app.state.processor
+    for _ in range(8):
+        proc.take_request()  # сегодня уже потрачено 8 из 10
+    pdf = tmp_path / "big.pdf"
+    blank_pdf(pdf, 45)
+    upload(client, "big.pdf", pdf.read_bytes(), formats=["summary", "x3"])  # нужно 4
+    small = tmp_path / "small.txt"
+    small.write_text("Текст небольшой книги. " * 40, "utf-8")
+    upload(client, "small.txt", small.read_bytes(), formats=["key"])  # нужен 1
+    assert run_queue(app, limit=1) == 1  # большая отложена без трат, маленькая сделана
+    big, little = app.state.store.list()
+    assert big.status == "queued" and "продолжу завтра" in (big.progress or "") and big.done_list == []
+    assert little.status == "done" and app.state.store.requests_on(proc.today()) == 9
+    assert "продолжу завтра" in client.get("/", auth=AUTH).text
+
+
+def test_non_utf8_file_name_in_inbox(tmp_path):
+    import os
+    client, s, app = make(tmp_path, FakeSummarizer())
+    name = "Книга про лес.txt".encode("cp1251")
+    with open(os.path.join(os.fsencode(s.inbox), name), "wb") as f:
+        f.write(("Текст книги. " * 40).encode())
+    assert client.get("/", auth=AUTH).status_code == 200  # раньше — 500 на каждой странице
+    assert [p.name for p in s.inbox.iterdir()] == ["Книга про лес.txt"]
+    assert app.state.store.list()[0].source == "Книга про лес.txt"
+
+
+def test_one_line_text_is_split_and_truncated_answer_is_error(tmp_path):
+    text = "Очень длинное предложение книги без пустых строк. " * 4000  # ~28 000 слов одним абзацем
+    parts = split_text(text, 6000)
+    assert len(parts) >= 4 and max(len(p.split()) for p in parts) <= 6000
+
+    class Truncating(FakeClient):
+        def __init__(self, api_key):
+            super().__init__(api_key)
+            reason = type("C", (), {"finish_reason": "FinishReason.MAX_TOKENS"})()
+            self.models.generate_content = lambda model, contents: type("R", (), {"text": "обрыв", "candidates": [reason]})()
+
+    g = GeminiSummarizer("k", "m", tmp_path, client_factory=Truncating, sleep=lambda s: None)
+    with pytest.raises(Exception, match="MAX_TOKENS"):
+        g._generate(["x", "prompt"])
+
+
+def test_git_url_fixed_in_env_reconnects(tmp_path):
+    from bookhub.gitsync import GitSync
+    good = tmp_path / "remote.git"
+    typo = tmp_path / "remote-typo.git"
+    base = dict(web_password="secret-pass-42", data_dir=tmp_path / "data")
+    s1 = Settings(**base, git_repo_url=str(typo))
+    s1.ensure_dirs()
+    (s1.books_dir / "a.md").write_text("заметка", "utf-8")
+    g1 = GitSync(s1)
+    assert g1.sync("first") is False and not (s1.vault / ".git").exists()  # .git не остался «отвязанным»
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(good)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(good), str(seed)], check=True, capture_output=True)
+    (seed / "README.md").write_text("vault", "utf-8")
+    for cmd in (["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed"], ["push", "origin", "HEAD:main"]):
+        subprocess.run(["git", *cmd], cwd=seed, check=True, capture_output=True)
+    g2 = GitSync(Settings(**base, git_repo_url=str(good)))
+    assert g2.sync("second") is True, g2.last_error
+    files = ls_remote(good)
+    assert "README.md" in files and "Books/a.md" in files
+    # смена адреса в .env у уже подключённого хранилища
+    other = tmp_path / "other.git"
+    subprocess.run(["git", "clone", "--bare", str(good), str(other)], check=True, capture_output=True)
+    g3 = GitSync(Settings(**base, git_repo_url=str(other)))
+    (s1.books_dir / "b.md").write_text("новая", "utf-8")
+    assert g3.sync("third") is True and "Books/b.md" in ls_remote(other)
+
+
+def test_restore_never_silently_deletes_newer_data(tmp_path):
+    from bookhub.backup import make_backup, restore
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf")
+    run_queue(app)
+    archive = make_backup(s)
+    (s.books_dir / "newer.md").write_text("написано после копии", "utf-8")
+    s.db_path.unlink()  # база «испорчена» и удалена
+    with pytest.raises(ConfigError, match="obsidian_vault"):
+        restore(s, archive)
+    kept = restore(s, archive, force=True)
+    assert (kept / "obsidian_vault" / "Books" / "newer.md").read_text("utf-8") == "написано после копии"
+    assert (s.books_dir / "a - Автор.md").exists() and s.db_path.exists()
+
+
+def test_more_formats_with_nothing_selected(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf", formats=["key"])
+    run_queue(app)
+    r = client.post("/notes/a - Автор (ключевые моменты).md/more", auth=AUTH, data={}, follow_redirects=False)
+    assert r.headers["location"] == "/?m=nothing" and app.state.store.list("queued") == []
+
+
+def test_daily_without_key_does_nothing_and_delete_cleans_inbox(tmp_path):
+    client, s, app = make(tmp_path)  # без ключа
+    upload(client, "a.pdf")
+    asyncio.run(app.state.processor.daily())
+    job = app.state.store.list()[0]
+    assert job.status == "queued" and "GEMINI_API_KEY" in app.state.store.get_meta("last_daily_run")
+    app.state.store.claim_next()
+    app.state.store.mark_error(job.id, "что-то пошло не так")
+    client.post(f"/jobs/{job.id}/delete", auth=AUTH)
+    client.get("/", auth=AUTH)
+    assert app.state.store.list() == [] and not (s.inbox / "a.pdf").exists()  # книга не вернулась в очередь
+
+
+def test_chunked_upload_is_size_limited(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer(), max_upload_mb=1)
+
+    def body():
+        yield b"--x\r\nContent-Disposition: form-data; name=\"files\"; filename=\"a.pdf\"\r\nContent-Type: application/pdf\r\n\r\n%PDF"
+        for _ in range(8):
+            yield b"0" * (1024 * 1024)
+        yield b"\r\n--x--\r\n"
+
+    r = client.post("/add", auth=AUTH, content=body(), headers={"content-type": "multipart/form-data; boundary=x",
+                                                                 "accept": "text/html"})
+    assert r.status_code == 413 and list(s.inbox.iterdir()) == []
+
+
+def test_note_with_hand_edited_words_and_code(tmp_path):
+    client, s, app = make(tmp_path)
+    (s.books_dir / "n.md").write_text('---\ntitle: "N"\nwords: 1 200\nsource_words: abc\n---\n\n'
+                                      "Код: `a < b && c`\n\n```\nif x < 1 && y:\n```\n", "utf-8")
+    page = client.get("/notes/n.md", auth=AUTH)
+    assert page.status_code == 200
+    assert "<code>a &lt; b &amp;&amp; c</code>" in page.text and "&amp;lt;" not in page.text
+
+
+def test_maintenance_cleans_even_when_backups_are_off(tmp_path):
+    import os
+    client, s, app = make(tmp_path, FakeSummarizer(), backup_time="off")
+    item = app.state.trash.put((s.inbox / "x.txt").write_text("x") and s.inbox / "x.txt")
+    os.utime(s.trash / item, (0, 0))
+    report = app.state.processor.maintenance(with_backup=False)
+    assert "backup" not in report and report["trash_purged"] == 1

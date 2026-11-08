@@ -10,7 +10,6 @@ import logging
 import mimetypes
 import os
 import re
-import secrets
 import shutil
 import urllib.parse
 import uuid
@@ -24,17 +23,17 @@ import nh3
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.gzip import GZipMiddleware
 
 from .config import Settings
 from .extract import FORMATS as FILE_TYPES, looks_valid, split_name
 from .formats import FORMATS, parse_formats
 from .gitsync import GitSync
-from .guard import GuardMiddleware, LoginLimiter
+from .guard import BodyTooLarge, GuardMiddleware, LoginLimiter, check_basic
 from .library import find_book, library, parse_meta
 from .notify import Notifier
 from .store import JobStore
@@ -108,7 +107,7 @@ def render_note(text: str) -> tuple[str, str]:
         end = text.find("\n---", 4)
         if end != -1:
             front, text = text[4:end].strip(), text[end + 4:].lstrip("\n")
-    text = text.replace("&", "&amp;").replace("<", "&lt;")
+    # Сырой HTML не экранируем заранее (иначе в блоках кода видно «&lt;»): всё лишнее вычищает nh3 ниже.
     # Карточки «Вопрос::Ответ» показываем списком
     text = re.sub(r"^(?![\s>#*-])(.+?)::(.+)$", r"- **\1** — \2", text, flags=re.M)
     text = re.sub(r"^(\s*[-*]) \[ \]", r"\1 ☐", text, flags=re.M)
@@ -133,8 +132,11 @@ def note_props(meta: dict[str, str]) -> list[tuple[str, str]]:
             value = value.strip("[]")
         if value:
             props.append((label, value))
-    if meta.get("words") and meta.get("source_words"):
-        props.append(("Объём", f"≈ {int(meta['words']):,} слов из {int(meta['source_words']):,}".replace(",", " ")))
+    try:
+        words, source_words = int(meta.get("words", "")), int(meta.get("source_words", ""))
+        props.append(("Объём", f"≈ {words:,} слов из {source_words:,}".replace(",", " ")))
+    except ValueError:
+        pass  # поля нет или его исправили вручную во что-то нечисловое
     hidden = {*PROP_LABELS, "title", "author", "book", "format", "words", "source_words"}
     props += [(k, v) for k, v in meta.items() if k not in hidden and v]
     return props
@@ -205,6 +207,42 @@ def acquire_scheduler_lock(s: Settings):
         return None
 
 
+class SecurityHeaders:
+    """Заголовки безопасности и кэширования. Чистый ASGI, а не BaseHTTPMiddleware: тот выполняет приложение
+    в группе задач и заворачивает ошибки (например, «слишком большой запрос») в ExceptionGroup."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path", "")
+        versioned = "v" in urllib.parse.parse_qs(scope.get("query_string", b"").decode("latin-1"))
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Content-Security-Policy"] = CSP
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["Referrer-Policy"] = "same-origin"
+                if path.startswith("/static/") and message["status"] == 200:
+                    if versioned or path.startswith("/static/vendor/"):
+                        # Версия в адресе (?v=… или в имени файла) — содержимое по этому адресу не меняется никогда.
+                        headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                    else:
+                        headers["Cache-Control"] = "public, max-age=604800"
+                elif path == "/live":
+                    headers["Cache-Control"] = "no-store"
+                elif "cache-control" not in headers:
+                    # no-cache, а не no-store: браузер может вернуть страницу кнопкой «Назад» мгновенно (bfcache),
+                    # но каждый новый показ всё равно сверяет её с сервером.
+                    headers["Cache-Control"] = "no-cache"
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 def create_app(settings: Settings | None = None, summarizer: Summarizer | None = None,
                start_scheduler: bool = True) -> FastAPI:
     s = settings or Settings.from_env()
@@ -222,6 +260,10 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     if isinstance(summarizer, GeminiSummarizer):
         summarizer.max_requests = s.max_requests_per_job
         summarizer.meter = proc.take_request
+        summarizer.plan_check = proc.check_plan
+    if s.daily_request_limit and s.max_requests_per_job > s.daily_request_limit:
+        log.warning("MAX_REQUESTS_PER_JOB (%d) больше DAILY_REQUEST_LIMIT (%d): такие книги не уложатся в сутки",
+                    s.max_requests_per_job, s.daily_request_limit)
     tasks: set[asyncio.Task] = set()
 
     def missed_daily_run() -> bool:
@@ -235,7 +277,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         return now >= now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0) and last < now.strftime("%Y-%m-%d")
 
     async def maintenance_job() -> None:
-        await asyncio.to_thread(proc.maintenance)
+        await asyncio.to_thread(proc.maintenance, s.backup_at() is not None)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -250,8 +292,9 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             if hm:
                 sched.add_job(proc.daily, "cron", hour=hm[0], minute=hm[1], id="daily")
                 log.info("Ежедневный разбор: %s (%s), по %d шт.", s.daily_run_time, s.timezone, s.daily_batch_size)
-            if bt:
-                sched.add_job(maintenance_job, "cron", hour=bt[0], minute=bt[1], id="maintenance")
+            # Корзина и кэш чистятся всегда (в BACKUP_TIME, а если копии выключены — в 03:30).
+            at = bt or (3, 30)
+            sched.add_job(maintenance_job, "cron", hour=at[0], minute=at[1], id="maintenance")
             sched.start()
             if missed_daily_run():
                 log.info("Ежедневный разбор был пропущен — запущу его через минуту")
@@ -271,28 +314,8 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["asset_v"] = static_version(HERE / "static")
     templates.env.filters["when"] = lambda value: human_when(value, s.tz)
-    security = HTTPBasic(realm="Book Hub")
 
-    @app.middleware("http")
-    async def security_headers(request: Request, call_next):
-        resp = await call_next(request)
-        resp.headers["Content-Security-Policy"] = CSP
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["Referrer-Policy"] = "same-origin"
-        path = request.url.path
-        if path.startswith("/static/") and resp.status_code == 200:
-            if "v" in request.query_params or path.startswith("/static/vendor/"):
-                # Версия в адресе (?v=… или в имени файла) — содержимое по этому адресу не меняется никогда.
-                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-            else:
-                resp.headers["Cache-Control"] = "public, max-age=604800"
-        elif path == "/live":
-            resp.headers["Cache-Control"] = "no-store"
-        elif "cache-control" not in resp.headers:
-            # no-cache, а не no-store: браузер может вернуть страницу кнопкой «Назад» мгновенно (bfcache),
-            # но каждый новый показ всё равно сверяет её с сервером.
-            resp.headers["Cache-Control"] = "no-cache"
-        return resp
+    app.add_middleware(SecurityHeaders)
 
     ERROR_TITLES = {400: "Неверный запрос", 403: "Доступ запрещён", 404: "Не найдено", 405: "Так нельзя",
                     413: "Слишком большой файл", 422: "Неверные данные", 500: "Что-то пошло не так"}
@@ -313,6 +336,10 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         detail = {"Not Found": "Такой страницы нет.", "Method Not Allowed": "Такое действие здесь недоступно."}.get(detail, detail)
         return error_page(request, exc.status_code, detail, getattr(exc, "headers", None))
 
+    @app.exception_handler(BodyTooLarge)
+    async def body_too_large(request: Request, exc: BodyTooLarge):
+        return error_page(request, 413, f"Слишком большой запрос: больше {s.max_request_bytes // 1048576} МБ за один раз.")
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
         return error_page(request, 422, "Форма заполнена неверно — вернитесь и попробуйте ещё раз.")
@@ -328,17 +355,19 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     app.add_middleware(GuardMiddleware, user=s.web_user, password=s.web_password,
                        max_body=s.max_request_bytes, limiter=limiter)
 
-    def auth(request: Request, c: HTTPBasicCredentials = Depends(security)) -> str:
-        ok_user = secrets.compare_digest(c.username.encode(), s.web_user.encode())
-        ok_pass = secrets.compare_digest(c.password.encode(), s.web_password.encode())
-        if not (ok_user and ok_pass):
-            raise HTTPException(401, "Неверный логин или пароль", headers={"WWW-Authenticate": 'Basic realm="Book Hub"'})
+    def auth(request: Request) -> str:
+        # Пароль уже проверила охрана (guard.py); здесь — второй рубеж тем же разбором (UTF-8:
+        # пароль и логин могут быть на кириллице) и защита от CSRF.
+        header = request.headers.get("authorization", "").encode("latin-1", errors="replace")
+        if not check_basic(header, s.web_user, s.web_password):
+            raise HTTPException(401, "Неверный логин или пароль",
+                                headers={"WWW-Authenticate": 'Basic realm="Book Hub", charset="UTF-8"'})
         # Защита от CSRF: формы принимаем только со своего же сайта.
         if request.method == "POST":
             origin = request.headers.get("origin")
             if origin and urllib.parse.urlsplit(origin).netloc != request.headers.get("host"):
                 raise HTTPException(403, "Запрос с чужого сайта")
-        return c.username
+        return s.web_user
 
     def back(msg: str, **extra: str) -> RedirectResponse:
         query = urllib.parse.urlencode({"m": msg, **extra})
@@ -374,7 +403,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         except Exception:
             checks["db"] = False
         checks["disk"] = shutil.disk_usage(s.data_dir).free > 200 * 1024 * 1024
-        stale = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(timespec="seconds")
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat(timespec="seconds")
         checks["queue"] = not any(j.updated_at < stale for j in store.list("processing")) if checks["db"] else False
         return checks
 
@@ -519,8 +548,8 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     async def delete(job_id: int, _: str = Depends(auth)):
         job = store.delete(job_id)
         undo = ""
-        # Файл ещё не взятой в работу книги лежит в inbox — переносим его в корзину, а не стираем.
-        if job and job.is_file and job.status == "queued":
+        # Файл книги, ещё лежащий в inbox, переносим в корзину (иначе он снова встанет в очередь).
+        if job and job.is_file and job.status != "done":
             path = s.inbox / Path(job.source).name
             if path.is_file():
                 undo = trash.put(path)

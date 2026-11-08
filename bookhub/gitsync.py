@@ -6,6 +6,7 @@ import base64
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 from datetime import datetime
@@ -67,26 +68,41 @@ class GitSync:
             raise GitError(self._mask(f"git {args[0]}: {(res.stderr or res.stdout).strip()}"))
         return res
 
+    def _configure(self) -> None:
+        """Адрес и автор — из настроек при каждой синхронизации: их могли поправить в .env."""
+        self._git("remote", "set-url", "origin", self.s.git_repo_url)
+        self._git("config", "user.name", self.s.git_author_name)
+        self._git("config", "user.email", self.s.git_author_email)
+
     def _ensure_repo(self) -> None:
         if (self.vault / ".git").exists():
+            self._configure()
             return
         self.vault.mkdir(parents=True, exist_ok=True)
         self._git("init", "-b", self.s.git_branch)
         self._git("remote", "add", "origin", self.s.git_repo_url)
-        self._git("config", "user.name", self.s.git_author_name)
-        self._git("config", "user.email", self.s.git_author_email)
-        if self._git("fetch", "origin", self.s.git_branch, check=False).returncode == 0:
+        self._configure()
+        fetch = self._git("fetch", "origin", self.s.git_branch, check=False)
+        if fetch.returncode == 0:
             # В репозитории уже есть хранилище: встаём поверх него. Для файлов, которые есть и там, и здесь,
             # берём версию из репозитория (её могли править в Obsidian), новые локальные заметки остаются.
             self._git("reset", f"origin/{self.s.git_branch}")
             self._git("checkout", "--", ".", check=False)
+        elif "couldn't find remote ref" not in fetch.stderr:
+            # Репозиторий недоступен (опечатка в адресе, нет сети, неверный токен): не оставляем .git,
+            # не связанный с удалённой историей, — в следующий раз присоединимся заново.
+            shutil.rmtree(self.vault / ".git", ignore_errors=True)
+            raise GitError(self._mask(f"git fetch: {fetch.stderr.strip()}"))
 
     def _merge_preferring_remote(self) -> None:
         """Конфликт при pull: слияние, где побеждает версия из репозитория."""
         self._git("rebase", "--abort", check=False)
-        merge = self._git("merge", "--no-edit", "-X", "theirs", f"origin/{self.s.git_branch}", check=False)
+        merge = self._git("merge", "--no-edit", "--allow-unrelated-histories", "-X", "theirs",
+                          f"origin/{self.s.git_branch}", check=False)
         if merge.returncode == 0:
             return
+        if not (self.vault / ".git" / "MERGE_HEAD").exists():  # слияние даже не началось — это не конфликт
+            raise GitError(self._mask(f"git merge: {(merge.stderr or merge.stdout).strip()}"))
         unmerged = self._git("diff", "--name-only", "--diff-filter=U").stdout.split("\n")
         for path in filter(None, unmerged):
             # Файл есть в репозитории — берём его оттуда; удалён там — удаляем и у нас.

@@ -116,7 +116,7 @@ def parse_formats(values, default: list[str] | None = None) -> list[str]:
         values = values.split(",")
     wanted = {v.strip() for v in values or [] if v and v.strip()}
     picked = [f for f in FORMATS if f in wanted]
-    return picked or list(default or ["summary"])
+    return picked or list(["summary"] if default is None else default)
 
 
 def compress_prompt(ratio: int, words: int, part: int, total: int, first: bool, book: str | None) -> str:
