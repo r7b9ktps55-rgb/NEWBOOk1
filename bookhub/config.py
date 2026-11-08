@@ -36,7 +36,7 @@ class Settings:
     web_password: str
     web_user: str = "me"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-flash-latest"
     data_dir: Path = Path("data")
     vault_subfolder: str = "Books"
     obsidian_vault_name: str = ""
@@ -73,7 +73,7 @@ class Settings:
             web_password=env("WEB_PASSWORD"),
             web_user=env("WEB_USER", "me") or "me",
             gemini_api_key=env("GEMINI_API_KEY"),
-            gemini_model=env("GEMINI_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash",
+            gemini_model=env("GEMINI_MODEL", "gemini-flash-latest") or "gemini-flash-latest",
             data_dir=Path(env("DATA_DIR", "data") or "data"),
             vault_subfolder=env("OBSIDIAN_VAULT_SUBFOLDER", "Books"),
             obsidian_vault_name=env("OBSIDIAN_VAULT_NAME"),
