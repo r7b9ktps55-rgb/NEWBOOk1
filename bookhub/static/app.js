@@ -55,7 +55,7 @@ function setupReveal(root = document) {
 const toastBox = document.querySelector("[data-toasts]");
 
 function toast(text, kind = "ok", action = null) {
-  if (!toastBox) return;
+  if (!toastBox) return null;
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
   el.innerHTML = ICONS[kind] || ICONS.ok;
@@ -83,6 +83,14 @@ function toast(text, kind = "ok", action = null) {
   el.addEventListener("focusout", run);
   el.addEventListener("click", (e) => { if (!e.target.closest("form, button, a")) close(); });
   run();
+  // Обновить текст уже показанного уведомления и продлить его жизнь
+  el.update = (newText) => {
+    span.textContent = newText;
+    clearTimeout(timer);
+    left = action ? 9000 : 4500;
+    run();
+  };
+  return el;
 }
 
 function flashToToast() {
@@ -318,6 +326,8 @@ function setupLive(root) {
   let active = Number(root.dataset.active || 0);
   let busy = root.dataset.busy === "1";
   let timer = 0;
+  let doneToast = null;
+  let readyCount = 0;
   const offline = document.querySelector("[data-offline]");
   const setOffline = (on, text) => {
     if (!offline) return;
@@ -370,8 +380,11 @@ function setupLive(root) {
           applyFilter();
         }
         if (d.notes > notes) {
-          const n = d.notes - notes;
-          toast(`Готово: ${n} ${plural(n, "новая заметка", "новые заметки", "новых заметок")}`);
+          // Одно уведомление со счётчиком, а не стопка «Готово: 1 новая заметка»
+          readyCount = doneToast?.isConnected ? readyCount + (d.notes - notes) : d.notes - notes;
+          const text = `Готово: ${readyCount} ${plural(readyCount, "новая заметка", "новые заметки", "новых заметок")}`;
+          if (doneToast?.isConnected) doneToast.update(text);
+          else doneToast = toast(text);
         }
         notes = d.notes;
         active = d.active;
