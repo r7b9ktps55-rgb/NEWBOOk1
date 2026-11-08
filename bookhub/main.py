@@ -121,6 +121,29 @@ def note_props(meta: dict[str, str]) -> list[tuple[str, str]]:
     return props
 
 
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
+          "ноября", "декабря"]
+
+
+def human_when(value: str | None, tz) -> str:
+    """«2026-11-08 09:00» → «сегодня в 09:00», «вчера в 09:00» или «6 ноября в 09:00»."""
+    if not value:
+        return ""
+    try:
+        moment = datetime.strptime(value[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return value
+    today = datetime.now(tz).date()
+    day = moment.date()
+    if day == today:
+        prefix = "сегодня"
+    elif (today - day).days == 1:
+        prefix = "вчера"
+    else:
+        prefix = f"{day.day} {MONTHS[day.month - 1]}" + ("" if day.year == today.year else f" {day.year}")
+    return f"{prefix} в {moment:%H:%M}"
+
+
 def static_version(folder: Path) -> str:
     """Меняется при любом изменении файлов в static/ — чтобы браузер не держал старые стили и скрипты."""
     h = hashlib.sha1()
@@ -228,6 +251,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["asset_v"] = static_version(HERE / "static")
+    templates.env.filters["when"] = lambda value: human_when(value, s.tz)
     security = HTTPBasic(realm="Book Hub")
 
     @app.middleware("http")

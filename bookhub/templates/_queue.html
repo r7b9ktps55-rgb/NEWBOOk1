@@ -10,9 +10,9 @@
 {% if git.last_error %}<p class="flash warn">Git: {{ git.last_error }}</p>{% endif %}
 <dl class="status">
   <div><dt>Расписание</dt><dd>{% if s.daily_time() %}каждый день в {{ s.daily_run_time }}, по {{ s.daily_batch_size }} шт.{% else %}выключено{% endif %}</dd></div>
-  {% if last_daily %}<div><dt>Последний разбор</dt><dd>{{ last_daily.at }} — {{ last_daily.result }}</dd></div>{% endif %}
+  {% if last_daily %}<div><dt>Последний разбор</dt><dd>{{ last_daily.at|when }} — {{ last_daily.result }}</dd></div>{% endif %}
   <div><dt>Запросов к Gemini сегодня</dt><dd>{{ requests_today }}{% if s.daily_request_limit %} из {{ s.daily_request_limit }}{% endif %}</dd></div>
-  {% if git.enabled %}<div><dt>Git</dt><dd>{% if git.last_sync %}синхронизировано {{ git.last_sync }}{% else %}ещё не синхронизировалось{% endif %}</dd></div>{% endif %}
+  {% if git.enabled %}<div><dt>Git</dt><dd>{% if git.last_sync %}синхронизировано {{ git.last_sync|when }}{% else %}ещё не синхронизировалось{% endif %}</dd></div>{% endif %}
 </dl>
 {% if active %}
 <ul class="queue" data-stagger>

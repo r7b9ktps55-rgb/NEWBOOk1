@@ -1118,3 +1118,16 @@ def test_log_times_use_timezone(tmp_path):
     record.created = 0  # 1970-01-01 00:00 UTC = 09:00 в Токио
     assert logging.Formatter("%(asctime)s").format(record).startswith("1970-01-01 09:00:00")
     assert _time.localtime  # стандартный converter не сломан для других модулей
+
+
+
+def test_human_when():
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from bookhub.main import human_when
+    tz = ZoneInfo("Europe/Saratov")
+    now = datetime.now(tz)
+    assert human_when(now.strftime("%Y-%m-%d") + " 09:05", tz) == "сегодня в 09:05"
+    assert human_when((now - timedelta(days=1)).strftime("%Y-%m-%d") + " 23:59", tz) == "вчера в 23:59"
+    assert human_when("2020-03-06 07:00", tz) == "6 марта 2020 в 07:00"
+    assert human_when(None, tz) == "" and human_when("непонятно", tz) == "непонятно"
