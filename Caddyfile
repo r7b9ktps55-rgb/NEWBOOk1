@@ -1,0 +1,10 @@
+# HTTPS-прокси для Book Hub. Сертификат Let's Encrypt Caddy получает и продлевает сам.
+# Домен берётся из DOMAIN в .env.
+{$DOMAIN} {
+	encode gzip
+	header Strict-Transport-Security "max-age=31536000"
+	request_body {
+		max_size 1010MB
+	}
+	reverse_proxy bookhub:8080
+}

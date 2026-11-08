@@ -82,12 +82,13 @@ def restore(s: Settings, archive: Path, force: bool = False) -> None:
     """Распаковывает копию в папку данных. Без --force — только в пустую папку."""
     if s.db_path.exists() and not force:
         raise ConfigError(f"В {s.data_dir} уже есть данные. Остановите сайт и добавьте --force, чтобы заменить их.")
+    s.data_dir.mkdir(parents=True, exist_ok=True)
+    # Распаковываем внутрь папки данных: в контейнере писать можно только туда.
+    stage = s.data_dir / ".restore-tmp"
+    shutil.rmtree(stage, ignore_errors=True)
     with tarfile.open(archive, "r:gz") as tar:
         members = [m for m in tar.getmembers() if m.name.startswith("data/")]
-        stage = s.data_dir.parent / f".restore-{archive.stem}"
-        shutil.rmtree(stage, ignore_errors=True)
         tar.extractall(stage, members=members, filter="data")  # filter="data" не пускает пути за пределы папки
-    s.data_dir.mkdir(parents=True, exist_ok=True)
     for item in (stage / "data").iterdir():
         dest = s.data_dir / item.name
         if dest.is_dir() and not dest.is_symlink():

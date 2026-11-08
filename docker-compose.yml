@@ -10,3 +10,37 @@ services:
       - "${BIND:-127.0.0.1}:${PORT:-8080}:8080"
     volumes:
       - ./data:/app/data
+    # Даём закончить запись заметки перед остановкой
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # HTTPS для доступа из интернета (нужен домен, указывающий на сервер, и открытые порты 80/443):
+  #   docker compose --profile https up -d
+  caddy:
+    image: caddy:2.10.2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - bookhub
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy-data:
+  caddy-config:
