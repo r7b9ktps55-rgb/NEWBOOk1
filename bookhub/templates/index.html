@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% from "_formats.html" import picker %}
+{% from "_icons.html" import icon %}
+{% block head_extra %}{% if busy %}<noscript><meta http-equiv="refresh" content="15"></noscript>{% endif %}{% endblock %}
+{% block nav %}
+<div class="nav-links">
+  <a href="#add" class="nav-opt">Добавить</a>
+  <a href="#queue">Очередь <span class="count" data-live-count>{{ active|length }}</span></a>
+  <a href="#library" class="nav-opt">Библиотека</a>
+</div>
+{% endblock %}
+{% block content %}
+{% if message %}
+<div class="flash {{ message_kind }}" role="status" data-flash="{{ message_kind }}">
+  <span>{{ message }}</span>
+  {% if undo %}<form action="/trash/{{ undo }}/restore" method="post"><button class="btn small ghost">Отменить</button></form>{% endif %}
+</div>
+{% endif %}
+{% if not has_key %}<p class="flash warn">Не задан <code>GEMINI_API_KEY</code> — добавьте его в <code>.env</code> и перезапустите.</p>{% endif %}
+
+<section class="hero {% if books %}hero-compact{% endif %}" aria-labelledby="hero-title">
+  <h1 class="display" id="hero-title">Книги — в&nbsp;<mark class="marker" data-draw>заметки для&nbsp;Obsidian</mark></h1>
+  {% if books %}
+  <details class="how" data-how>
+    <summary class="btn ghost small">{{ icon("play") }} Как это работает</summary>
+    {% include "_scene.html" %}
+  </details>
+  {% else %}
+  <p class="lead">Загрузите книгу или ссылку — Gemini сделает конспект, подберёт цитаты, разберёт героев или перескажет короче в&nbsp;2–5&nbsp;раз.</p>
+  <div class="how" data-how>{% include "_scene.html" %}</div>
+  {% endif %}
+</section>
+
+<section class="section" id="add" aria-labelledby="add-title">
+  <h2 class="h2" id="add-title">Добавить книгу</h2>
+  <form action="/add" method="post" enctype="multipart/form-data" class="card" data-reveal data-busy-form>
+    <label class="drop" data-drop data-types="{{ file_exts|join(',') }}">
+      <input type="file" name="files" multiple>
+      {{ icon("upload", "drop-icon") }}
+      <span class="drop-title">Выберите файлы или перетащите сюда</span>
+      <span class="drop-hint">{{ file_types|join(", ") }} · до {{ s.max_upload_mb }} МБ</span>
+    </label>
+    <ul class="drop-files" data-drop-list hidden></ul>
+    <div class="or">или ссылка на статью</div>
+    <label class="visually-hidden" for="url">Ссылка на статью</label>
+    <input class="input" id="url" type="url" name="url" placeholder="https://…" inputmode="url" autocomplete="off">
+    {{ picker(formats, checked) }}
+    <button class="btn primary wide">В очередь</button>
+  </form>
+</section>
+
+<p class="flash warn" data-offline hidden>Нет связи с сервером — обновлю очередь, когда связь вернётся.</p>
+<div class="live" data-live data-version="{{ version }}" data-lib-version="{{ lib_version }}" data-notes="{{ notes_total }}" data-active="{{ active|length }}" data-busy="{{ 1 if busy else 0 }}">
+  <section class="section" id="queue" aria-labelledby="queue-title" data-live-queue>
+    {% include "_queue.html" %}
+  </section>
+  <section class="section" id="library" aria-labelledby="library-title" data-live-library>
+    {% include "_library.html" %}
+  </section>
+</div>
+{% endblock %}

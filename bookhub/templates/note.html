@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "_formats.html" import picker %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ heading }} — Book Hub{% endblock %}
+{% block nav %}<div class="nav-links"><a href="/#library">Библиотека</a></div>{% endblock %}
+{% block content %}
+<article class="reader">
+  <a href="/#library" class="back">← Библиотека</a>
+  {% if book and book.notes|length > 1 %}
+  <nav class="tags" aria-label="Форматы этой книги">
+    {% for n in book.notes %}<a class="tag {% if n.name == name %}current{% endif %}" href="/notes/{{ n.name|urlencode }}" {% if n.name == name %}aria-current="page"{% endif %}>{{ n.label }}</a>{% endfor %}
+  </nav>
+  {% endif %}
+  <header class="reader-head" data-reveal>
+    <span class="caps"><mark class="marker" data-draw>{{ format_label }}</mark></span>
+    <h1 dir="auto">{{ heading }}</h1>
+    {% if author %}<p class="byline" dir="auto">{{ author }}</p>{% endif %}
+  </header>
+  <div class="toolbar">
+    {% if obsidian_uri %}<a class="btn primary" href="{{ obsidian_uri }}">{{ icon("open") }}В Obsidian</a>{% endif %}
+    <button class="btn ghost" type="button" data-copy-url="/notes/{{ name|urlencode }}/download">{{ icon("copy") }}<span>Скопировать</span></button>
+    <a class="btn ghost" href="/notes/{{ name|urlencode }}/download">{{ icon("download") }}Скачать .md</a>
+    <form action="/notes/{{ name|urlencode }}/delete" method="post" data-confirm="Удалить заметку «{{ heading }}»?">
+      <button class="btn icon" aria-label="Удалить заметку">{{ icon("trash") }}</button>
+    </form>
+  </div>
+  {% if props %}<dl class="props">{% for k, v in props %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl>{% endif %}
+  <div class="prose">{{ html|safe }}</div>
+</article>
+
+{% if book and book.formats|length < formats|length %}
+<details class="card more reader">
+  <summary>Сделать из этой книги ещё…</summary>
+  <form action="/notes/{{ name|urlencode }}/more" method="post" data-busy-form>
+    {{ picker(formats, (), book.formats) }}
+    <button class="btn primary" {% if not has_key %}disabled aria-describedby="no-key"{% endif %}>В очередь</button>
+    {% if not has_key %}<p class="hint" id="no-key">Сначала задайте <code>GEMINI_API_KEY</code> в <code>.env</code> и перезапустите сайт.</p>{% endif %}
+  </form>
+</details>
+{% endif %}
+{% endblock %}

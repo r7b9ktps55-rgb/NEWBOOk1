@@ -1,0 +1,51 @@
+{% from "_icons.html" import icon %}
+<div class="section-head">
+  <h2 class="h2" id="queue-title">Очередь <span class="count">{{ active|length }}</span></h2>
+  {% if busy %}
+  <p class="busy-note" role="status"><span class="spinner" aria-hidden="true"></span>Идёт разбор — очередь обновляется сама</p>
+  {% else %}
+  <form action="/run" method="post" class="run" data-busy-form>
+    <button class="btn primary" {% if not has_key or not active %}disabled{% endif %}>Разобрать 1</button>
+    <button class="btn ghost" name="all" value="1" {% if not has_key or not active %}disabled{% endif %}>Всю очередь</button>
+  </form>
+  {% endif %}
+</div>
+{% if limit_reached %}<p class="flash warn">Дневной лимит запросов к Gemini исчерпан ({{ requests_today }} из {{ s.daily_request_limit }}). Очередь продолжит разбираться завтра.</p>{% endif %}
+{% if git.last_error %}<p class="flash warn">Git: {{ git.last_error }}</p>{% endif %}
+<dl class="status">
+  <div><dt>Расписание</dt><dd>{% if s.daily_time() %}каждый день в {{ s.daily_run_time }}, по {{ s.daily_batch_size }} шт.{% else %}выключено{% endif %}</dd></div>
+  {% if last_daily %}<div><dt>Последний разбор</dt><dd>{{ last_daily.at|when }} — {{ last_daily.result }}</dd></div>{% endif %}
+  <div><dt>Запросов к Gemini сегодня</dt><dd>{{ requests_today }}{% if s.daily_request_limit %} из {{ s.daily_request_limit }}{% endif %}</dd></div>
+  {% if git.enabled %}<div><dt>Git</dt><dd>{% if git.last_sync %}синхронизировано {{ git.last_sync|when }}{% else %}ещё не синхронизировалось{% endif %}</dd></div>{% endif %}
+</dl>
+{% if active %}
+<ul class="queue" data-stagger>
+  {% for j in active %}
+  <li class="job" data-job="{{ j.id }}">
+    <div class="job-row">
+      <span class="job-type">{{ j.type_label }}</span>
+      <span class="job-title" dir="auto" title="{{ j.source }}">{{ j.title }}</span>
+      <span class="pill {{ j.status }}">{{ {'queued': 'в очереди', 'processing': 'в работе', 'error': 'ошибка'}[j.status] }}</span>
+      {% if j.status != 'processing' %}
+      <span class="job-actions">
+        {% if j.status == 'error' %}
+        <form action="/jobs/{{ j.id }}/retry" method="post"><button class="btn small ghost" aria-label="Повторить">{{ icon("retry") }}<span class="label">Повторить</span></button></form>
+        {% endif %}
+        <form action="/jobs/{{ j.id }}/delete" method="post" data-confirm="Убрать «{{ j.title }}» из очереди?"><button class="btn icon" aria-label="Убрать из очереди">{{ icon("x") }}</button></form>
+      </span>
+      {% endif %}
+    </div>
+    <div class="tags">
+      {% for f in j.format_list if f in formats %}<span class="tag {% if f in j.done_list %}done{% endif %}">{% if f in j.done_list %}{{ icon("check") }}{% endif %}{{ formats[f].label }}</span>{% endfor %}
+    </div>
+    {% if j.progress and j.status == 'queued' %}<p class="hint">{{ j.progress }}</p>{% endif %}
+    {% if j.status == 'processing' %}
+    <div class="job-progress"><p>{{ j.progress or "Начинаю" }}…</p><div class="bar"></div></div>
+    {% endif %}
+    {% if j.error %}<p class="job-error">{{ j.error }}</p>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<div class="empty">{{ icon("inbox") }}<b>Очередь пуста</b><span>Добавьте книгу или ссылку — она появится здесь.</span></div>
+{% endif %}
