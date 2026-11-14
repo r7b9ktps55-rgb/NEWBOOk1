@@ -1,0 +1,18 @@
+# systemd-сервис для запуска без Docker.
+# Скопируйте в /etc/systemd/system/ и поправьте User/WorkingDirectory.
+[Unit]
+Description=Home TV Remote (Android TV via ADB)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/tv-remote
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+# Environment=ACCESS_PIN=1234
+
+[Install]
+WantedBy=multi-user.target

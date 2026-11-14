@@ -1,0 +1,19 @@
+{
+  "name": "home-tv-remote",
+  "version": "1.0.0",
+  "description": "Домашний пульт для Android TV / Xiaomi через ADB, PWA для телефонов",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "ADB_PATH=./tools/fake-adb.js node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT",
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  }
+}

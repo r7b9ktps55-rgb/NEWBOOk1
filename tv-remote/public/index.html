@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0d0e12">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Пульт">
+  <title>Пульт ТВ</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <!-- Шапка -->
+    <header class="top">
+      <button class="tv-pill" id="tvPill" aria-label="Выбрать телевизор">
+        <span class="dot" id="tvDot"></span>
+        <span class="tv-name" id="tvName">Нет телевизора</span>
+        <i data-icon="chevron-down" class="ic-sm"></i>
+      </button>
+      <div class="top-actions">
+        <button class="icon-btn" id="shotBtn" aria-label="Скриншот экрана ТВ"><i data-icon="screen"></i></button>
+        <button class="icon-btn" id="settingsBtn" aria-label="Настройки пульта"><i data-icon="sliders"></i></button>
+      </div>
+    </header>
+
+    <div class="banner" id="banner" hidden></div>
+
+    <main class="views">
+      <!-- ПУЛЬТ -->
+      <section class="view active" data-view="remote">
+        <div class="row4">
+          <button class="btn round power" data-key="power" aria-label="Питание"><i data-icon="power"></i></button>
+          <button class="btn round" data-key="input" aria-label="Источник"><i data-icon="input"></i></button>
+          <button class="btn round" data-key="mute" aria-label="Без звука"><i data-icon="mute"></i></button>
+          <button class="btn round" data-key="settings" aria-label="Настройки ТВ"><i data-icon="gear"></i></button>
+        </div>
+
+        <div class="seg" role="tablist" aria-label="Режим навигации">
+          <button class="seg-btn active" data-mode="pad" role="tab">Сенсор</button>
+          <button class="seg-btn" data-mode="dpad" role="tab">Кнопки</button>
+        </div>
+
+        <div class="pad-wrap">
+          <div class="touchpad" id="touchpad" aria-label="Сенсорная панель: свайп — стрелки, тап — OK">
+            <div class="tp-hint" id="tpHint">Свайп — стрелки · Тап — OK<br><small>Удерживайте после свайпа — прокрутка</small></div>
+            <div class="tp-dot" id="tpDot"></div>
+            <div class="tp-arrow" id="tpArrow"></div>
+          </div>
+          <div class="dpad" id="dpad" hidden>
+            <button class="dp up" data-key="up" data-repeat aria-label="Вверх"><i data-icon="chevron-up"></i></button>
+            <button class="dp left" data-key="left" data-repeat aria-label="Влево"><i data-icon="chevron-left"></i></button>
+            <button class="dp ok" data-key="ok" data-longpress aria-label="OK">OK</button>
+            <button class="dp right" data-key="right" data-repeat aria-label="Вправо"><i data-icon="chevron-right"></i></button>
+            <button class="dp down" data-key="down" data-repeat aria-label="Вниз"><i data-icon="chevron-down"></i></button>
+          </div>
+        </div>
+
+        <div class="row3">
+          <button class="btn" data-key="back" data-longpress aria-label="Назад"><i data-icon="back"></i><span>Назад</span></button>
+          <button class="btn" data-key="home" aria-label="Домой"><i data-icon="home"></i><span>Домой</span></button>
+          <button class="btn" data-key="recents" aria-label="Недавние"><i data-icon="grid"></i><span>Недавние</span></button>
+        </div>
+
+        <div class="rockers">
+          <div class="rocker">
+            <button data-key="vol_up" data-repeat aria-label="Громче"><i data-icon="plus"></i></button>
+            <span class="rocker-label">VOL</span>
+            <button data-key="vol_down" data-repeat aria-label="Тише"><i data-icon="minus"></i></button>
+          </div>
+          <button class="mic" id="micBtn" aria-label="Голосовая команда"><i data-icon="mic"></i></button>
+          <div class="rocker">
+            <button data-key="ch_up" data-repeat aria-label="Канал вверх"><i data-icon="chevron-up"></i></button>
+            <span class="rocker-label">CH</span>
+            <button data-key="ch_down" data-repeat aria-label="Канал вниз"><i data-icon="chevron-down"></i></button>
+          </div>
+        </div>
+
+        <div class="media">
+          <button class="btn flat" data-key="rewind" data-repeat aria-label="Перемотка назад"><i data-icon="rewind"></i></button>
+          <button class="btn flat" data-key="prev" aria-label="Предыдущее"><i data-icon="prev"></i></button>
+          <button class="btn flat accent" data-key="play_pause" aria-label="Пауза / воспроизведение"><i data-icon="playpause"></i></button>
+          <button class="btn flat" data-key="next" aria-label="Следующее"><i data-icon="next"></i></button>
+          <button class="btn flat" data-key="ff" data-repeat aria-label="Перемотка вперёд"><i data-icon="ff"></i></button>
+        </div>
+      </section>
+
+      <!-- ПРИЛОЖЕНИЯ -->
+      <section class="view" data-view="apps">
+        <div class="view-head">
+          <h2>Приложения</h2>
+          <button class="icon-btn" id="appsRefresh" aria-label="Обновить список"><i data-icon="refresh"></i></button>
+        </div>
+        <div class="apps-grid" id="appsGrid"></div>
+        <p class="muted center" id="appsEmpty" hidden></p>
+      </section>
+
+      <!-- КЛАВИАТУРА -->
+      <section class="view" data-view="keyboard">
+        <div class="view-head"><h2>Ввод текста</h2></div>
+        <p class="muted">Поставьте курсор в поле поиска на ТВ, введите текст и нажмите «Отправить». Можно надиктовать голосом через микрофон клавиатуры телефона.</p>
+        <textarea id="kbText" rows="3" placeholder="Например: фильмы про космос" autocomplete="off"></textarea>
+        <div class="kb-actions">
+          <button class="btn wide accent" id="kbSend"><i data-icon="send"></i><span>Отправить</span></button>
+          <button class="btn" data-key="del" data-repeat aria-label="Стереть символ"><i data-icon="backspace"></i></button>
+          <button class="btn" data-key="enter" aria-label="Enter"><i data-icon="enter"></i></button>
+        </div>
+        <label class="check"><input type="checkbox" id="kbLive"> Печатать сразу (каждую букву)</label>
+        <div class="kb-actions">
+          <button class="btn wide" id="kbClear"><i data-icon="trash"></i><span>Стереть поле на ТВ</span></button>
+          <button class="btn wide" id="kbSearch"><i data-icon="search"></i><span>Искать на ТВ</span></button>
+        </div>
+      </section>
+
+      <!-- ЕЩЁ -->
+      <section class="view" data-view="more">
+        <div class="view-head"><h2>Ещё кнопки</h2></div>
+        <div class="numpad">
+          <button class="btn" data-key="1">1</button><button class="btn" data-key="2">2</button><button class="btn" data-key="3">3</button>
+          <button class="btn" data-key="4">4</button><button class="btn" data-key="5">5</button><button class="btn" data-key="6">6</button>
+          <button class="btn" data-key="7">7</button><button class="btn" data-key="8">8</button><button class="btn" data-key="9">9</button>
+          <button class="btn" data-key="info" aria-label="Инфо"><i data-icon="info"></i></button>
+          <button class="btn" data-key="0">0</button>
+          <button class="btn" data-key="guide" aria-label="Телегид"><i data-icon="list"></i></button>
+        </div>
+        <div class="colors">
+          <button class="cbtn red" data-key="red" aria-label="Красная"></button>
+          <button class="cbtn green" data-key="green" aria-label="Зелёная"></button>
+          <button class="cbtn yellow" data-key="yellow" aria-label="Жёлтая"></button>
+          <button class="cbtn blue" data-key="blue" aria-label="Синяя"></button>
+        </div>
+        <div class="grid3">
+          <button class="btn" data-key="menu"><i data-icon="menu"></i><span>Меню</span></button>
+          <button class="btn" data-key="captions"><i data-icon="cc"></i><span>Субтитры</span></button>
+          <button class="btn" data-key="search"><i data-icon="search"></i><span>Поиск</span></button>
+          <button class="btn" data-key="assist"><i data-icon="sparkle"></i><span>Ассистент</span></button>
+          <button class="btn" data-key="stop"><i data-icon="stop"></i><span>Стоп</span></button>
+          <button class="btn" data-key="wakeup"><i data-icon="sun"></i><span>Разбудить</span></button>
+        </div>
+        <div class="view-head"><h2>Экран ТВ</h2><button class="icon-btn" id="shotBtn2" aria-label="Сделать скриншот"><i data-icon="refresh"></i></button></div>
+        <div class="shot" id="shotBox"><p class="muted center">Нажмите <i data-icon="screen" class="ic-inline"></i>, чтобы увидеть, что сейчас на экране. Видео из платных сервисов может быть чёрным — это защита DRM.</p></div>
+      </section>
+    </main>
+
+    <!-- Нижние вкладки -->
+    <nav class="tabs" aria-label="Разделы">
+      <button class="tab active" data-tab="remote"><i data-icon="remote"></i><span>Пульт</span></button>
+      <button class="tab" data-tab="apps"><i data-icon="grid"></i><span>Приложения</span></button>
+      <button class="tab" data-tab="keyboard"><i data-icon="keyboard"></i><span>Текст</span></button>
+      <button class="tab" data-tab="more"><i data-icon="dots"></i><span>Ещё</span></button>
+    </nav>
+  </div>
+
+  <!-- Голос -->
+  <div class="overlay" id="voice" hidden>
+    <div class="voice-card">
+      <button class="icon-btn close" id="voiceClose" aria-label="Закрыть"><i data-icon="x"></i></button>
+      <div class="voice-orb" id="voiceOrb"><i data-icon="mic"></i></div>
+      <p class="voice-status" id="voiceStatus">Говорите…</p>
+      <p class="voice-text" id="voiceText"></p>
+      <form class="voice-form" id="voiceForm">
+        <input id="voiceInput" type="text" placeholder="Скажите или напишите команду" autocomplete="off" enterkeyhint="send">
+        <button class="btn accent" type="submit" aria-label="Выполнить"><i data-icon="send"></i></button>
+      </form>
+      <p class="muted small" id="voiceHint"></p>
+      <div class="chips" id="voiceChips"></div>
+    </div>
+  </div>
+
+  <!-- Настройки -->
+  <div class="sheet-backdrop" id="sheet" hidden>
+    <div class="sheet" role="dialog" aria-label="Настройки">
+      <div class="sheet-grip"></div>
+      <div class="sheet-head">
+        <h2>Телевизоры</h2>
+        <button class="icon-btn" id="sheetClose" aria-label="Закрыть"><i data-icon="x"></i></button>
+      </div>
+      <div class="tv-list" id="tvList"></div>
+
+      <details class="card" id="addCard">
+        <summary><i data-icon="plus"></i> Добавить телевизор</summary>
+        <form id="addForm" class="form">
+          <label>Название<input name="name" placeholder="Зал" maxlength="40"></label>
+          <label>IP-адрес телевизора<input name="host" placeholder="192.168.1.50" inputmode="decimal" required></label>
+          <label>MAC для включения по Wi-Fi (необязательно)<input name="mac" placeholder="AA:BB:CC:DD:EE:FF"></label>
+          <button class="btn accent wide" type="submit"><i data-icon="plus"></i><span>Добавить</span></button>
+        </form>
+        <button class="btn wide" id="discoverBtn"><i data-icon="wifi"></i><span>Найти телевизоры в сети</span></button>
+        <div id="discoverList" class="discover"></div>
+      </details>
+
+      <details class="card">
+        <summary><i data-icon="link"></i> Сопряжение (Android 11+ / Google TV)</summary>
+        <p class="muted small">На ТВ: Настройки → Для разработчиков → Отладка по Wi-Fi → «Подключить по коду». Введите сюда порт и код с экрана ТВ.</p>
+        <form id="pairForm" class="form">
+          <label>Телевизор<select name="tv" id="pairTv"></select></label>
+          <div class="form-row">
+            <label>Порт сопряжения<input name="port" inputmode="numeric" placeholder="37123" required></label>
+            <label>Код (6 цифр)<input name="code" inputmode="numeric" maxlength="6" placeholder="123456" required></label>
+          </div>
+          <label>Порт подключения (с экрана «Отладка по Wi-Fi», «IP-адрес и порт»)<input name="connectPort" inputmode="numeric" placeholder="5555 или 41234"></label>
+          <button class="btn accent wide" type="submit"><i data-icon="link"></i><span>Сопрячь</span></button>
+        </form>
+      </details>
+
+      <details class="card" id="shareCard">
+        <summary><i data-icon="qr"></i> Поставить на другие телефоны</summary>
+        <p class="muted small">Отсканируйте QR камерой телефона и выберите «Добавить на главный экран». Ссылка с HTTPS нужна для голосового управления.</p>
+        <div class="qr-list" id="qrList"></div>
+      </details>
+
+      <details class="card">
+        <summary><i data-icon="sliders"></i> Пульт</summary>
+        <label class="check"><input type="checkbox" id="optHaptics" checked> Вибрация при нажатии</label>
+        <label class="check"><input type="checkbox" id="optFastSwipe"> Чувствительный сенсор (короче свайп)</label>
+      </details>
+    </div>
+  </div>
+
+  <!-- PIN -->
+  <div class="overlay" id="login" hidden>
+    <form class="voice-card" id="loginForm">
+      <div class="voice-orb"><i data-icon="lock"></i></div>
+      <p class="voice-status">Введите PIN пульта</p>
+      <input id="pinInput" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN">
+      <button class="btn accent wide" type="submit"><span>Войти</span></button>
+      <p class="muted small" id="loginErr"></p>
+    </form>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="icons.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

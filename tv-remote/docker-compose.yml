@@ -1,0 +1,15 @@
+services:
+  tv-remote:
+    build: .
+    container_name: tv-remote
+    restart: unless-stopped
+    # host-сеть нужна для автопоиска ТВ и Wake-on-LAN
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Europe/Moscow
+      # - ACCESS_PIN=1234                      # PIN для входа в пульт (необязательно)
+      # - TV_HOSTS=Зал=192.168.1.50,Спальня=192.168.1.51   # ТВ при первом запуске
+      # - PORT=8080
+      # - HTTPS_PORT=8443
