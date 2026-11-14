@@ -1,0 +1,36 @@
+# Облачный режим: пульт за HTTPS-прокси Caddy с бесплатным сертификатом Let's Encrypt.
+# Настройки берутся из файла .env (его создаёт deploy/cloud-setup.sh).
+services:
+  tv-remote:
+    build: .
+    container_name: tv-remote
+    restart: unless-stopped
+    # host-сеть: контейнер видит Tailscale-сеть сервера (100.x.x.x), если она настроена
+    network_mode: host
+    env_file: .env
+    environment:
+      - BIND=127.0.0.1
+      - PORT=8080
+      - HTTPS=0
+      - TRUST_PROXY=1
+      - PUBLIC_URL=https://${DOMAIN}
+    volumes:
+      - ./data:/app/data
+
+  caddy:
+    image: caddy:2.8
+    container_name: tv-remote-caddy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - tv-remote
+
+volumes:
+  caddy_data:
+  caddy_config:

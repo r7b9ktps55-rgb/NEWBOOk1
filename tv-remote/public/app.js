@@ -10,6 +10,7 @@
 
   const state = {
     tvs: [],
+    agents: [],
     tvId: store.get('tvId', null),
     haptics: store.get('haptics', true),
     fastSwipe: store.get('fastSwipe', false),
@@ -65,7 +66,7 @@
     ws.onopen = () => { wsReady = true; wsBackoff = 500; };
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
-      if (msg.t === 'status') { state.tvs = msg.tvs; renderStatus(); return; }
+      if (msg.t === 'status') { state.tvs = msg.tvs; state.agents = msg.agents || []; renderStatus(); return; }
       const p = pending.get(msg.id);
       if (p) { pending.delete(msg.id); clearTimeout(p.timer); p.resolve(msg); }
     };
@@ -272,6 +273,7 @@
     $('#tvName').textContent = tv ? tv.name : 'Добавить ТВ';
     $('#tvDot').className = 'dot ' + (tv ? tv.state : '');
     if (!tv) setBanner('Телевизор ещё не добавлен. <button id="bnAdd">Добавить</button>');
+    else if (tv.state === 'agent_offline') setBanner(`Домашний агент «${esc(tv.agent)}» не в сети: проверьте, что устройство дома включено и агент запущен.`, true);
     else if (tv.state === 'unauthorized') setBanner('На экране телевизора появился запрос «Разрешить отладку по USB?» — отметьте «Всегда разрешать» и нажмите «OK».');
     else if (tv.state !== 'device') setBanner(`«${esc(tv.name)}» не в сети (${esc(tv.host)}). Включите ТВ и проверьте, что отладка включена. <button id="bnRetry">Повторить</button>`, true);
     else setBanner('');
@@ -496,7 +498,8 @@
   $('#sheetClose').addEventListener('click', closeSheet);
   sheet.addEventListener('click', (e) => { if (e.target === sheet) closeSheet(); });
 
-  const STATE_TEXT = { device: 'подключён', unauthorized: 'ждёт подтверждения на ТВ', offline: 'не в сети', unknown: 'проверяю…' };
+  const STATE_TEXT = { device: 'подключён', unauthorized: 'ждёт подтверждения на ТВ', offline: 'не в сети', unknown: 'проверяю…', agent_offline: 'агент не в сети' };
+  const viaText = (t) => (t.agent ? `через агент «${t.agent}»` : (state.info && state.info.cloud ? 'напрямую (Tailscale)' : 'напрямую'));
   function renderTvList() {
     const list = $('#tvList');
     if (!state.tvs.length) {
@@ -505,7 +508,7 @@
       list.innerHTML = state.tvs.map((t) => `
         <div class="tv-item ${t.id === state.tvId ? 'current' : ''}" data-id="${esc(t.id)}">
           <span class="dot ${esc(t.state)}"></span>
-          <div class="meta" data-act="select"><b>${esc(t.name)}</b><small>${esc(t.host)}:${esc(t.port)} · ${esc(STATE_TEXT[t.state] || t.state)}</small></div>
+          <div class="meta" data-act="select"><b>${esc(t.name)}</b><small>${esc(t.host)}:${esc(t.port)} · ${esc(viaText(t))} · ${esc(STATE_TEXT[t.state] || t.state)}</small></div>
           <button class="icon-btn" data-act="connect" aria-label="Переподключить"><i data-icon="refresh"></i></button>
           <button class="icon-btn" data-act="edit" aria-label="Изменить"><i data-icon="edit"></i></button>
           <button class="icon-btn" data-act="delete" aria-label="Удалить"><i data-icon="trash"></i></button>
@@ -527,13 +530,15 @@
         };
       });
     }
+    renderVia();
+    renderAgents();
     $('#pairTv').innerHTML = state.tvs.map((t) => `<option value="${esc(t.id)}">${esc(t.name)} (${esc(t.host)})</option>`).join('');
   }
 
   $('#addForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = e.target;
-    const body = { name: f.name.value.trim() || 'Телевизор', host: f.host.value.trim(), mac: f.mac.value.trim() };
+    const body = { name: f.name.value.trim() || 'Телевизор', host: f.host.value.trim(), mac: f.mac.value.trim(), agent: f.agent.value };
     try {
       const { tv } = await api('/api/tvs', { method: 'POST', body });
       state.tvId = tv.id; store.set('tvId', tv.id);
@@ -544,9 +549,9 @@
 
   $('#discoverBtn').addEventListener('click', async () => {
     const box = $('#discoverList');
-    box.innerHTML = '<p class="muted small">Ищу устройства с открытым ADB (порт 5555)… до 15 секунд</p>';
+    box.innerHTML = '<p class="muted small">Ищу устройства с открытым ADB (порт 5555)… до 30 секунд</p>';
     try {
-      const { hosts } = await api('/api/discover');
+      const { hosts } = await api(`/api/discover?via=${encodeURIComponent($('#addVia').value)}`);
       if (!hosts.length) { box.innerHTML = '<p class="muted small">Ничего не найдено. Убедитесь, что на ТВ включена отладка по сети, или добавьте IP вручную.</p>'; return; }
       box.innerHTML = hosts.map((h) => `<button class="btn" data-host="${esc(h.host)}" ${h.known ? 'disabled' : ''}><span>${esc(h.host)}</span><span class="muted">${h.known ? 'уже добавлен' : 'добавить'}</span></button>`).join('');
       $$('button[data-host]', box).forEach((b) => b.addEventListener('click', () => {
@@ -576,9 +581,67 @@
     list.innerHTML = arr.map((u) => `
       <div class="qr-item">
         <img src="/api/qr?text=${encodeURIComponent(u)}" alt="QR-код">
-        <div><code>${esc(u)}</code><p>${u.startsWith('https') ? 'С голосом. При первом входе: «Дополнительно» → «Перейти на сайт».' : 'Без предупреждений, голос — через клавиатуру.'}</p></div>
+        <div><code>${esc(u)}</code><p>${state.info && state.info.cloud ? 'Работает откуда угодно: голос и установка приложения поддерживаются.' : u.startsWith('https') ? 'С голосом. При первом входе: «Дополнительно» → «Перейти на сайт».' : 'Без предупреждений, голос — через клавиатуру.'}</p></div>
       </div>`).join('');
   }
+
+  function renderVia() {
+    const sel = $('#addVia');
+    const prev = sel.value;
+    const cloud = state.info && state.info.cloud;
+    const opts = [`<option value="">${cloud ? 'Напрямую с сервера (Tailscale / VPN)' : 'Напрямую с этого сервера'}</option>`]
+      .concat(state.agents.map((a) => `<option value="${esc(a.name)}">Через домашний агент «${esc(a.name)}»${a.online ? '' : ' (не в сети)'}</option>`));
+    sel.innerHTML = opts.join('');
+    const online = state.agents.find((a) => a.online);
+    sel.value = prev && [...sel.options].some((o) => o.value === prev) ? prev : (cloud && online ? online.name : '');
+    updateHostHint();
+  }
+  function updateHostHint() {
+    const via = $('#addVia').value;
+    const cloud = state.info && state.info.cloud;
+    $('#addHostHint').textContent = via ? '(домашний, например 192.168.1.50)' : cloud ? '(Tailscale-адрес ТВ, например 100.101.102.103)' : '';
+    $('#addForm').host.placeholder = !via && cloud ? '100.101.102.103' : '192.168.1.50';
+  }
+  $('#addVia').addEventListener('change', updateHostHint);
+
+  function renderAgents() {
+    const box = $('#agentList');
+    if (!state.agents.length) { box.innerHTML = '<p class="muted small">Агенты ещё не подключались.</p>'; return; }
+    box.innerHTML = state.agents.map((a) => `
+      <div class="tv-item"><span class="dot ${a.online ? 'device' : 'offline'}"></span>
+        <div class="meta"><b>${esc(a.name)}</b><small>${a.online ? `в сети · ${esc(a.platform || '')} · v${esc(a.version || '?')}` : 'не в сети'}</small></div>
+      </div>`).join('');
+  }
+
+  $('#agentShow').addEventListener('click', async () => {
+    const box = $('#agentSetup');
+    if (!box.hidden) { box.hidden = true; return; }
+    try {
+      const r = await api('/api/agent-setup');
+      if (!r.enabled) {
+        box.innerHTML = '<p class="muted small">Агенты выключены. Задайте переменную <b>AGENT_TOKEN</b> на сервере (скрипт облачной установки делает это сам) и перезапустите его.</p>';
+      } else {
+        const u = esc(r.url), t = esc(r.token);
+        box.innerHTML = `
+          <h3>Старый Android-телефон (Termux)</h3>
+          <pre>curl -fsSL ${u}/agent-termux.sh | SERVER_URL=${u} AGENT_TOKEN=${t} AGENT_NAME=Дом bash</pre>
+          <h3>Raspberry Pi / Linux</h3>
+          <pre>curl -fsSL ${u}/agent-linux.sh | sudo SERVER_URL=${u} AGENT_TOKEN=${t} AGENT_NAME=Дом bash</pre>
+          <h3>Вручную (Windows / macOS / Linux, нужен Node.js и adb)</h3>
+          <pre>git clone https://github.com/r7b9ktps55-rgb/NEWBOOk1.git
+cd NEWBOOk1/tv-remote && npm ci --omit=dev
+SERVER_URL=${u} AGENT_TOKEN=${t} AGENT_NAME=Дом node agent.js</pre>
+          <p class="muted small">Токен — это ключ к вашим телевизорам. Не публикуйте его.</p>`;
+      }
+      box.hidden = false;
+    } catch (e) { errToast(e.message); }
+  });
+
+  $('#logoutBtn').addEventListener('click', async () => {
+    if (!confirm('Выйти из пульта на этом телефоне?')) return;
+    try { await api('/api/logout', { method: 'POST' }); } catch (_) { /* */ }
+    location.reload();
+  });
 
   const optH = $('#optHaptics');
   optH.checked = state.haptics;
@@ -609,8 +672,11 @@
     try {
       state.info = await api('/api/info');
       if (state.info.needPin && !state.info.authed) { showLogin(); return; }
-      const { tvs } = await api('/api/tvs');
+      $('#logoutBtn').hidden = !state.info.needPin;
+      if (!state.info.cloud && !state.info.agents) $('#agentCard').hidden = true;
+      const { tvs, agents } = await api('/api/tvs');
       state.tvs = tvs;
+      state.agents = agents || [];
       renderStatus();
       if (!tvs.length) openSheet(true);
     } catch (e) {

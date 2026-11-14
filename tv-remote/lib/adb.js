@@ -180,9 +180,21 @@ class TvSession extends EventEmitter {
     return job.promise;
   }
 
-  async keys(codes) {
-    let p;
-    for (const c of codes) p = this.key(c);
+  /** Несколько нажатий одной командой (по 25 за раз). */
+  keys(codes) {
+    let p = Promise.resolve();
+    for (let i = 0; i < codes.length; i += 25) {
+      const chunk = codes.slice(i, i + 25);
+      const last = this.queue[this.queue.length - 1];
+      if (last && last.kind === 'keys' && !last.long && last.codes.length + chunk.length <= 25) {
+        last.codes.push(...chunk);
+        p = last.promise;
+        continue;
+      }
+      const job = { kind: 'keys', codes: chunk, long: false };
+      job.promise = this._enqueue(job);
+      p = job.promise;
+    }
     return p;
   }
 

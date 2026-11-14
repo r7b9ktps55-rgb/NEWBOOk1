@@ -1,0 +1,16 @@
+# Домашний агент в Docker (Raspberry Pi / NAS / домашний ПК).
+# Создайте рядом файл agent.env:
+#   SERVER_URL=https://ваш-домен
+#   AGENT_TOKEN=токен-из-настроек-пульта
+#   AGENT_NAME=Дом
+# и запустите: docker compose -f docker-compose.agent.yml up -d --build
+services:
+  tv-agent:
+    build: .
+    container_name: tv-agent
+    restart: unless-stopped
+    network_mode: host
+    command: ["node", "agent.js"]
+    env_file: agent.env
+    volumes:
+      - ./agent-data:/app/data

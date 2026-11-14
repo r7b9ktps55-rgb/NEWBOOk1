@@ -9,9 +9,21 @@
 - **Текст** в поиск на ТВ, **список приложений**, **скриншот экрана ТВ**
 - Несколько телевизоров, автопоиск, сопряжение Android 11+, Wake-on-LAN, PIN, QR для раздачи
 
-📄 [PROMPT.md](PROMPT.md): промт, по которому сделано приложение
-🛠 [INSTALL.md](INSTALL.md): пошаговая установка
+- **Два режима**: облачный сервер (доступ отовсюду, HTTPS, пароль) или домашний сервер
 
+📄 [PROMPT.md](PROMPT.md): промт, по которому сделано приложение
+☁️ [CLOUD.md](CLOUD.md): **установка на облачный сервер** (рекомендуется)
+🏠 [INSTALL.md](INSTALL.md): установка на домашний сервер, настройка ТВ
+
+### Облако (одна команда на VPS)
+```bash
+git clone https://github.com/r7b9ktps55-rgb/NEWBOOk1.git
+cd NEWBOOk1/tv-remote && sudo bash deploy/cloud-setup.sh
+```
+Связь облака с ТВ: приложение Tailscale на телевизоре **или** домашний агент
+(старый Android-телефон в Termux / Raspberry Pi / ПК). Подробности в [CLOUD.md](CLOUD.md).
+
+### Дома
 ```bash
 cd tv-remote
 docker compose up -d --build     # или: npm ci && npm start

@@ -186,7 +186,8 @@
         <summary><i data-icon="plus"></i> Добавить телевизор</summary>
         <form id="addForm" class="form">
           <label>Название<input name="name" placeholder="Зал" maxlength="40"></label>
-          <label>IP-адрес телевизора<input name="host" placeholder="192.168.1.50" inputmode="decimal" required></label>
+          <label>Как сервер достаёт до ТВ<select name="agent" id="addVia"></select></label>
+          <label>IP-адрес телевизора <span id="addHostHint" class="muted small"></span><input name="host" placeholder="192.168.1.50" autocapitalize="off" autocorrect="off" spellcheck="false" required></label>
           <label>MAC для включения по Wi-Fi (необязательно)<input name="mac" placeholder="AA:BB:CC:DD:EE:FF"></label>
           <button class="btn accent wide" type="submit"><i data-icon="plus"></i><span>Добавить</span></button>
         </form>
@@ -208,6 +209,14 @@
         </form>
       </details>
 
+      <details class="card" id="agentCard">
+        <summary><i data-icon="home"></i> Домашний агент (для облака)</summary>
+        <p class="muted small">Если пульт работает в облаке, ему нужен «мостик» домой: маленькая программа на любом домашнем устройстве (старый Android-телефон, Raspberry Pi, ПК). Она сама подключается к облаку, проброс портов не нужен.</p>
+        <div id="agentList" class="tv-list"></div>
+        <button class="btn wide" id="agentShow" type="button"><i data-icon="keyboard"></i><span>Показать команды установки</span></button>
+        <div id="agentSetup" class="agent-setup" hidden></div>
+      </details>
+
       <details class="card" id="shareCard">
         <summary><i data-icon="qr"></i> Поставить на другие телефоны</summary>
         <p class="muted small">Отсканируйте QR камерой телефона и выберите «Добавить на главный экран». Ссылка с HTTPS нужна для голосового управления.</p>
@@ -218,6 +227,7 @@
         <summary><i data-icon="sliders"></i> Пульт</summary>
         <label class="check"><input type="checkbox" id="optHaptics" checked> Вибрация при нажатии</label>
         <label class="check"><input type="checkbox" id="optFastSwipe"> Чувствительный сенсор (короче свайп)</label>
+        <button class="btn wide" id="logoutBtn" type="button" hidden><i data-icon="lock"></i><span>Выйти на этом телефоне</span></button>
       </details>
     </div>
   </div>
@@ -226,8 +236,8 @@
   <div class="overlay" id="login" hidden>
     <form class="voice-card" id="loginForm">
       <div class="voice-orb"><i data-icon="lock"></i></div>
-      <p class="voice-status">Введите PIN пульта</p>
-      <input id="pinInput" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN">
+      <p class="voice-status">Введите пароль пульта</p>
+      <input id="pinInput" type="password" autocomplete="current-password" placeholder="Пароль" autocapitalize="off">
       <button class="btn accent wide" type="submit"><span>Войти</span></button>
       <p class="muted small" id="loginErr"></p>
     </form>
