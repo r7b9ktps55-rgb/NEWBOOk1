@@ -15,22 +15,31 @@ import urllib.parse
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import markdown as md
 import nh3
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from markdown_it import MarkdownIt
+from mdit_py_plugins.deflist import deflist_plugin
+from mdit_py_plugins.footnote import footnote_plugin
 from starlette.datastructures import MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 
 from .config import Settings
-from .extract import FORMATS as FILE_TYPES, looks_valid, split_name
+from .extract import FORMATS as FILE_TYPES
+from .extract import looks_valid, split_name
 from .formats import FORMATS, parse_formats
 from .gitsync import GitSync
 from .guard import BodyTooLarge, GuardMiddleware, LoginLimiter, check_basic
@@ -60,6 +69,9 @@ MESSAGES = {
     "empty": ("Очередь пуста", "warn"),
     "retry": ("Задача снова в очереди", "ok"),
     "deleted": ("Удалено — файл лежит в корзине", "ok"),
+    "removed": ("Задача убрана из очереди", "ok"),
+    "inwork": ("Книга сейчас в работе — убрать её можно, когда разбор закончится", "warn"),
+    "nopick": ("Отметьте хотя бы один формат", "warn"),
     "restored": ("Восстановлено из корзины", "ok"),
     "trash_emptied": ("Корзина очищена", "ok"),
 }
@@ -74,15 +86,25 @@ CSP = (
 )
 
 
-# Markdown без attr_list и md_in_html: из текста заметки нельзя добавить атрибуты или сырой HTML.
-MD_EXTENSIONS = ["abbr", "def_list", "fenced_code", "footnotes", "tables", "sane_lists", "nl2br"]
+# markdown-it (CommonMark) работает за линейное время: заметка со «[[[[…» или «````…» не подвесит сайт,
+# как это было с Python-Markdown. Сырой HTML выключен (показывается текстом), атрибуты из текста не задать.
+MARKDOWN = (
+    MarkdownIt("commonmark", {"html": False, "breaks": True})
+    .enable(["table", "strikethrough"])
+    .use(footnote_plugin)
+    .use(deflist_plugin)
+)
 SAFE_TAGS = {
     "p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "b", "i", "del", "s", "sup", "sub",
     "code", "pre", "blockquote", "ul", "ol", "li", "dl", "dt", "dd", "table", "thead", "tbody", "tr", "th", "td",
-    "a", "span", "div", "abbr",
+    "a", "span", "div", "section",
 }
-SAFE_ATTRS = {"a": {"href", "title"}, "abbr": {"title"}, "th": {"align"}, "td": {"align"}, "sup": {"id"}, "li": {"id"}}
-SAFE_CLASSES = {"span": {"wikilink", "callout"}, "a": {"footnote-ref", "footnote-backref"}, "div": {"footnote"}}
+SAFE_ATTRS = {"a": {"href", "title", "id"}, "th": {"style"}, "td": {"style"}, "li": {"id"}, "ol": {"start"}}
+SAFE_CLASSES = {
+    "span": {"wikilink", "callout"}, "a": {"footnote-backref"}, "sup": {"footnote-ref"},
+    "section": {"footnotes"}, "ol": {"footnotes-list"}, "li": {"footnote-item"}, "hr": {"footnotes-sep"},
+}
+WIKILINK = re.compile(r"\[\[([^\]|\n]{1,200})(?:\|([^\]\n]{1,200}))?\]\]")
 
 
 _render_cache: dict[tuple[str, int, int], tuple[str, str]] = {}
@@ -107,18 +129,37 @@ def render_note(text: str) -> tuple[str, str]:
         end = text.find("\n---", 4)
         if end != -1:
             front, text = text[4:end].strip(), text[end + 4:].lstrip("\n")
-    # Сырой HTML не экранируем заранее (иначе в блоках кода видно «&lt;»): всё лишнее вычищает nh3 ниже.
     # Карточки «Вопрос::Ответ» показываем списком
-    text = re.sub(r"^(?![\s>#*-])(.+?)::(.+)$", r"- **\1** — \2", text, flags=re.M)
-    text = re.sub(r"^(\s*[-*]) \[ \]", r"\1 ☐", text, flags=re.M)
-    text = re.sub(r"^(\s*[-*]) \[[xX]\]", r"\1 ☑", text, flags=re.M)
-    html = md.markdown(text, extensions=MD_EXTENSIONS)
-    html = re.sub(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", lambda m: f'<span class="wikilink">{m.group(2) or m.group(1)}</span>', html)
+    text = re.sub(r"^(?![\s>#*-])(.+?)::(.+)$", r"- **\1** — \2", text, flags=re.MULTILINE)
+    text = re.sub(r"^(\s*[-*]) \[ \]", r"\1 ☐", text, flags=re.MULTILINE)
+    text = re.sub(r"^(\s*[-*]) \[[xX]\]", r"\1 ☑", text, flags=re.MULTILINE)
+    html = MARKDOWN.render(text)
+    html = WIKILINK.sub(lambda m: f'<span class="wikilink">{m.group(2) or m.group(1)}</span>', html)
+    # Заголовок страницы — единственный h1; «# …» из текста заметки становится h2.
+    html = re.sub(r"<(/?)h1>", r"<\1h2>", html)
     html = re.sub(r"\[!(\w+)\]", r'<span class="callout">\1</span>', html)
     # Последний рубеж: только разрешённые теги, атрибуты и ссылки http(s)/mailto.
     html = nh3.clean(html, tags=SAFE_TAGS, attributes=SAFE_ATTRS, allowed_classes=SAFE_CLASSES,
-                     url_schemes={"http", "https", "mailto"})
+                     url_schemes={"http", "https", "mailto"},
+                     filter_style_properties={"text-align"})
     return front, html
+
+
+def pdf_problem(path: Path) -> str:
+    """Причина, по которой PDF нельзя отдать в разбор (пустая строка — всё в порядке)."""
+    from pypdf import PdfReader
+
+    try:
+        reader = PdfReader(path)
+        if reader.is_encrypted:
+            # Пустой пароль (только запрет печати и т.п.) — читать можно.
+            if not reader.decrypt(""):
+                return "PDF защищён паролем — снимите защиту и загрузите снова"
+        if not len(reader.pages):
+            return "в PDF нет страниц"
+    except Exception:  # pypdf бросает разные ошибки на битых файлах
+        return "PDF повреждён"
+    return ""
 
 
 def note_props(meta: dict[str, str]) -> list[tuple[str, str]]:
@@ -334,6 +375,10 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     async def http_error(request: Request, exc: StarletteHTTPException):
         detail = exc.detail if isinstance(exc.detail, str) else "Ошибка"
         detail = {"Not Found": "Такой страницы нет.", "Method Not Allowed": "Такое действие здесь недоступно."}.get(detail, detail)
+        if detail.startswith(("Too many files", "Too many fields")):
+            detail = "Слишком много файлов за один раз — не больше 1000."
+        elif detail and detail[0].isascii() and detail[0].isalpha():
+            detail = "Запрос не удалось разобрать."  # технические английские сообщения не показываем
         return error_page(request, exc.status_code, detail, getattr(exc, "headers", None))
 
     @app.exception_handler(BodyTooLarge)
@@ -403,7 +448,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         except Exception:
             checks["db"] = False
         checks["disk"] = shutil.disk_usage(s.data_dir).free > 200 * 1024 * 1024
-        stale = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat(timespec="seconds")
+        stale = (datetime.now(UTC) - timedelta(minutes=60)).isoformat(timespec="seconds")
         checks["queue"] = not any(j.updated_at < stale for j in store.list("processing")) if checks["db"] else False
         return checks
 
@@ -446,10 +491,12 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         }
 
     @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request, m: str = "", undo: str = "", _: str = Depends(auth)):
+    async def index(request: Request, m: str = "", undo: str = "", skip: str = "", _: str = Depends(auth)):
         await asyncio.to_thread(proc.sync_inbox)
         state = await asyncio.to_thread(page_state)
         text, kind = MESSAGES.get(m, ("", ""))
+        if m == "rejected" and skip:
+            text = f"Пропущены: {skip[:600]}"
         types = list(FILE_TYPES.values())
         return templates.TemplateResponse(request, "index.html", {
             **state,
@@ -484,28 +531,31 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             "library": library_html,
         })
 
-    async def save_file(f: UploadFile, picked: list[str]) -> Path | None:
-        """Сохраняет книгу в inbox. None — если формат не поддерживается, файл битый или больше лимита."""
+    async def save_file(f: UploadFile, picked: list[str]) -> Path | str:
+        """Сохраняет книгу в inbox. Если не вышло — строка с причиной для пользователя."""
         limit = s.max_upload_mb * 1024 * 1024
         raw_stem, ext = split_name(Path(f.filename or "").name)
         if not ext:
-            return None
+            return "формат не поддерживается"
         # Сначала пишем во временный файл с уникальным именем: две одновременные загрузки не столкнутся.
         tmp = s.uploads_tmp / f"{uuid.uuid4().hex}.part"
-        size, ok = 0, True
+        size, problem = 0, ""
         with tmp.open("wb") as out:
             while chunk := await f.read(1024 * 1024):
                 if size == 0 and not looks_valid(ext, chunk[:4096]):
-                    ok = False
+                    problem = f"внутри не {FILE_TYPES[ext]}"
                     break
                 size += len(chunk)
                 if size > limit:
-                    ok = False
+                    problem = f"больше {s.max_upload_mb} МБ"
                     break
                 out.write(chunk)
-        if not (ok and size):
+        if problem or not size:
             tmp.unlink(missing_ok=True)
-            return None
+            return problem or "пустой файл"
+        if ext == ".pdf" and (problem := await asyncio.to_thread(pdf_problem, tmp)):
+            tmp.unlink(missing_ok=True)
+            return problem
 
         def place() -> Path:
             with proc.inbox_lock:  # имя выбирается и занимается атомарно (подхват inbox ждёт)
@@ -518,22 +568,25 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
 
     @app.post("/add")
     async def add(files: list[UploadFile] = File([]), url: str = Form(""), formats: list[str] = Form([]),
-                  _: str = Depends(auth)):
+                  skipped: str = Form(""), _: str = Depends(auth)):
         picked = parse_formats(formats, list(s.default_formats))
         files = [f for f in files if f.filename]
         url = url.strip()
         if not files and not url:
             return back("nothing")
-        rejected = 0
+        rejected = [skipped.strip()] if skipped.strip() else []  # отсеянные ещё в браузере
         for f in files:
-            if not await save_file(f, picked):
-                rejected += 1
+            result = await save_file(f, picked)
+            if isinstance(result, str):
+                rejected.append(f"{Path(f.filename or '').name} ({result})")
         if url:
             parts = urllib.parse.urlsplit(url)
             if parts.scheme not in ("http", "https") or not parts.netloc or len(url) > 2000:
                 return back("badurl")
             store.add("url", url, url, picked)
-        return back("rejected" if rejected else "added")
+        if rejected:
+            return back("rejected", skip="; ".join(rejected)[:600])
+        return back("added")
 
     @app.post("/run")
     async def run(all: str = Form(""), _: str = Depends(auth)):
@@ -544,27 +597,47 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         store.requeue(job_id)
         return back("retry")
 
+    def note_sources() -> set[str]:
+        return {b.source for b in library(s.books_dir) if b.source}
+
     @app.post("/jobs/{job_id}/delete")
     async def delete(job_id: int, _: str = Depends(auth)):
-        job = store.delete(job_id)
-        undo = ""
-        # Файл книги, ещё лежащий в inbox, переносим в корзину (иначе он снова встанет в очередь).
-        if job and job.is_file and job.status != "done":
-            path = s.inbox / Path(job.source).name
-            if path.is_file():
-                undo = trash.put(path)
-        return back("deleted", undo=undo) if undo else back("deleted")
+        job = store.get(job_id)
+        if job and job.status == "processing":
+            return back("inwork")
+
+        def remove() -> str:
+            with proc.inbox_lock:
+                gone = store.delete(job_id)
+                if not gone or not gone.is_file or gone.status == "done":
+                    return ""
+                # Файл книги переносим в корзину вместе с задачей: из inbox (иначе он снова встанет
+                # в очередь) или из архива (книга с ошибкой), если на него не ссылаются заметки.
+                path = proc.find_file(gone.source)
+                if not path or (path.parent == s.archive and path.name in note_sources()):
+                    return ""
+                return trash.put(path, job={"formats": gone.format_list, "book": gone.book, "title": gone.title})
+
+        if not job:
+            return back("removed")
+        undo = await asyncio.to_thread(remove)
+        return back("deleted", undo=undo) if undo else back("removed")
 
     @app.get("/notes/{name}", response_class=HTMLResponse)
-    async def view_note(request: Request, name: str, _: str = Depends(auth)):
+    async def view_note(request: Request, name: str, m: str = "", _: str = Depends(auth)):
         path = note_path(name)
-        text = path.read_text("utf-8")
-        front, html = render_note_cached(path, text)
-        file_in_vault = path.relative_to(s.vault.resolve()).with_suffix("").as_posix()
-        params = {"file": file_in_vault, "content": text}
-        if s.obsidian_vault_name:
-            params = {"vault": s.obsidian_vault_name, **params}
-        uri = "obsidian://new?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+        text = await asyncio.to_thread(path.read_text, "utf-8")
+        # Отрисовка — в отдельном потоке: большая заметка не задерживает остальные запросы.
+        front, html = await asyncio.to_thread(render_note_cached, path, text)
+        uri = ""
+        # Закодированный текст минимум вдвое длиннее (кириллица — вшестеро): заведомо длинную не кодируем.
+        if len(text) * 2 <= OBSIDIAN_URI_LIMIT:
+            file_in_vault = path.relative_to(s.vault.resolve()).with_suffix("").as_posix()
+            params = {"file": file_in_vault, "content": text}
+            if s.obsidian_vault_name:
+                params = {"vault": s.obsidian_vault_name, **params}
+            uri = "obsidian://new?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+        message, message_kind = MESSAGES.get(m, ("", ""))
         book = await asyncio.to_thread(find_book, s.books_dir, path.name)
         meta = parse_meta(text)
         fmt = FORMATS.get(meta.get("format", ""), FORMATS["summary"] if meta else None)
@@ -576,6 +649,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             "name": path.name, "front": front, "html": html,
             "obsidian_uri": uri if len(uri) <= OBSIDIAN_URI_LIMIT else "",
             "book": book, "formats": FORMATS, "has_key": summarizer is not None,
+            "message": message, "message_kind": message_kind,
         })
 
     @app.post("/notes/{name}/more")
@@ -583,8 +657,10 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         note_path(name)
         book = find_book(s.books_dir, name)
         picked = [f for f in parse_formats(formats, []) if not book or f not in book.formats]
-        if not book or not picked:
-            return back("nothing")
+        if not picked:
+            return RedirectResponse(f"/notes/{urllib.parse.quote(name)}?m=nopick#more", status_code=303)
+        if not book:
+            return back("nosource")
         src = book.source
         if src.startswith(("http://", "https://")):
             store.add("url", src, book.name, picked, book=book.name)
@@ -607,13 +683,37 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
 
     @app.post("/notes/{name}/delete")
     async def delete_note(name: str, _: str = Depends(auth)):
-        item = trash.put(note_path(name))
+        path = note_path(name)
+
+        def remove() -> str:
+            # Последняя заметка книги уходит в корзину вместе с исходным файлом из архива:
+            # книга не хранится бессрочно, а «Отменить» вернёт обе.
+            source = parse_meta(path.read_text("utf-8")).get("source", "")
+            also = []
+            book_file = s.archive / Path(source).name if source else None
+            if book_file and book_file.is_file() and not store.active_file(book_file.name):
+                others = [b for b in library(s.books_dir) if b.source == source
+                          and any(n.name != path.name for n in b.notes)]
+                if not others:
+                    also.append(book_file)
+            return trash.put(path, also=also)
+
+        item = await asyncio.to_thread(remove)
         sync_later(f"Remove {Path(name).stem}")
         return back("deleted", undo=item)
 
     @app.post("/trash/{item_id}/restore")
     async def restore(item_id: str, _: str = Depends(auth)):
-        restored = await asyncio.to_thread(trash.restore, item_id)
+        def put_back() -> Path | None:
+            with proc.inbox_lock:  # подхват inbox не должен поставить файл с форматами по умолчанию
+                job = trash.job(item_id)
+                restored = trash.restore(item_id)
+                if restored and job:
+                    store.add("file", restored.name, job.get("title") or split_name(restored.name)[0],
+                              job.get("formats") or None, book=job.get("book"))
+                return restored
+
+        restored = await asyncio.to_thread(put_back)
         if not restored:
             raise HTTPException(404, "В корзине такого нет")
         if restored.parent == s.books_dir.resolve():

@@ -1,8 +1,8 @@
 import asyncio
-import urllib.parse
 import io
 import sqlite3
 import subprocess
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -12,15 +12,34 @@ from pypdf import PdfWriter
 from bookhub.config import ConfigError, Settings
 from bookhub.extract import ExtractError, extract_text, looks_valid, split_name
 from bookhub.formats import parse_formats
+from bookhub.guard import LoginLimiter
 from bookhub.library import read_meta
 from bookhub.main import create_app, render_note
 from bookhub.store import JobStore
-from bookhub.summarizer import (GeminiSummarizer, Summary, page_groups, parse_output, safe_filename,
-                                split_text, with_frontmatter)
+from bookhub.summarizer import (
+    GeminiSummarizer,
+    Summary,
+    page_groups,
+    parse_output,
+    safe_filename,
+    split_text,
+    with_frontmatter,
+)
 from bookhub.worker import unique_path
 
 AUTH = ("me", "secret-pass-42")
-PDF = b"%PDF-1.4\n%fake\n"
+
+
+def _blank_pdf() -> bytes:
+    from pypdf import PdfWriter
+
+    w, buf = PdfWriter(), io.BytesIO()
+    w.add_blank_page(100, 100)
+    w.write(buf)
+    return buf.getvalue()
+
+
+PDF = _blank_pdf()  # настоящий PDF: загрузка проверяет, что файл открывается
 
 
 class FakeSummarizer:
@@ -165,7 +184,9 @@ def test_retry_skips_finished_formats(tmp_path):
 
 def test_upload_rejects_non_pdf(tmp_path):
     client, s, _ = make(tmp_path, FakeSummarizer(), max_upload_mb=1)
-    assert upload(client, "x.pdf", b"not a pdf").headers["location"] == "/?m=rejected"
+    r = upload(client, "x.pdf", b"not a pdf")
+    assert r.headers["location"].startswith("/?m=rejected&skip=")
+    assert "x.pdf (внутри не PDF)" in client.get(r.headers["location"], auth=AUTH).text
     upload(client, "big.pdf", PDF + b"0" * (2 * 1024 * 1024))
     upload(client, "x.exe")
     assert list(s.inbox.iterdir()) == []
@@ -563,7 +584,9 @@ def test_upload_epub_fb2_txt_and_process(tmp_path):
              ("files", ("Фейк.epub", b"not a zip", "application/epub+zip")),
              ("files", ("Программа.exe", b"MZ", "application/octet-stream"))]
     r = client.post("/add", auth=AUTH, files=files, follow_redirects=False)
-    assert r.headers["location"] == "/?m=rejected"
+    assert r.headers["location"].startswith("/?m=rejected")
+    skipped = urllib.parse.parse_qs(urllib.parse.urlsplit(r.headers["location"]).query)["skip"][0]
+    assert "Фейк.epub (внутри не EPUB)" in skipped and "Программа.exe (формат не поддерживается)" in skipped
     assert sorted(p.name for p in s.inbox.iterdir()) == ["Заметки.txt", "Мастер.epub"]
     home = client.get("/", auth=AUTH).text
     assert '<span class="job-type">EPUB</span>' in home and '<span class="job-type">TXT</span>' in home
@@ -726,9 +749,9 @@ def test_markdown_cannot_inject_attributes_or_js_links():
     _, html = render_note("## Т {: onclick=alert(1) }\n\n[жми](javascript:alert(1)) [ok](https://e.com) [[Тема]]\n\n"
                           "Сноска[^1]\n\n[^1]: Текст\n")
     assert "<h2>Т {: onclick=alert(1) }</h2>" in html  # осталось текстом, а не атрибутом
-    assert "<h2 " not in html and "javascript:" not in html
+    assert "<h2 " not in html and "href=\"javascript" not in html  # опасная ссылка осталась простым текстом
     assert 'href="https://e.com"' in html and 'rel="noopener noreferrer"' in html
-    assert '<span class="wikilink">Тема</span>' in html and 'class="footnote"' in html
+    assert '<span class="wikilink">Тема</span>' in html and 'class="footnotes"' in html
 
 
 def test_null_byte_in_note_name(tmp_path):
@@ -966,7 +989,8 @@ def test_more_formats_uses_right_book_after_name_reuse(tmp_path):
     upload(client, "a.pdf")  # другая книга B с тем же именем
     run_queue(app)
     note = next(s.books_dir.glob("*.md"))
-    assert read_meta(note)["source"] == "a (2).pdf"  # не a.pdf — это файл книги A
+    # Файл книги A ушёл в корзину вместе с её задачей, так что имя a.pdf теперь у книги B.
+    assert read_meta(note)["source"] == "a.pdf" and len(app.state.trash.items()) == 1
 
 
 def test_same_title_different_files_are_different_books(tmp_path):
@@ -1074,6 +1098,7 @@ def test_bad_timezone_rejected(tmp_path):
 
 def test_library_cache_sees_changes(tmp_path):
     import os
+
     from bookhub.library import library
     d = tmp_path / "Books"
     d.mkdir()
@@ -1116,6 +1141,7 @@ def test_stale_local_copy_does_not_overwrite_vault_edits(tmp_path):
 def test_log_times_use_timezone(tmp_path):
     import logging
     import time as _time
+
     from bookhub.main import setup_logging
     setup_logging(Settings(web_password="secret-pass-42", data_dir=tmp_path, timezone="Asia/Tokyo"))
     record = logging.LogRecord("x", logging.INFO, __file__, 1, "msg", None, None)
@@ -1128,6 +1154,7 @@ def test_log_times_use_timezone(tmp_path):
 def test_human_when():
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
+
     from bookhub.main import human_when
     tz = ZoneInfo("Europe/Saratov")
     now = datetime.now(tz)
@@ -1330,7 +1357,10 @@ def test_more_formats_with_nothing_selected(tmp_path):
     upload(client, "a.pdf", formats=["key"])
     run_queue(app)
     r = client.post("/notes/a - Автор (ключевые моменты).md/more", auth=AUTH, data={}, follow_redirects=False)
-    assert r.headers["location"] == "/?m=nothing" and app.state.store.list("queued") == []
+    # Остаёмся на странице заметки с понятной подсказкой, а не уходим на главную.
+    assert r.headers["location"].endswith("?m=nopick#more") and app.state.store.list("queued") == []
+    page = client.get(r.headers["location"], auth=AUTH).text
+    assert "Отметьте хотя бы один формат" in page
 
 
 def test_daily_without_key_does_nothing_and_delete_cleans_inbox(tmp_path):
@@ -1376,3 +1406,91 @@ def test_maintenance_cleans_even_when_backups_are_off(tmp_path):
     os.utime(s.trash / item, (0, 0))
     report = app.state.processor.maintenance(with_backup=False)
     assert "backup" not in report and report["trash_purged"] == 1
+
+
+# ---------- Находки предстартового аудита ----------
+
+def test_undo_queue_delete_keeps_picked_formats(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf", formats=["cards", "x5"])
+    job = app.state.store.list("queued")[0]
+    r = client.post(f"/jobs/{job.id}/delete", auth=AUTH, follow_redirects=False)
+    undo = urllib.parse.parse_qs(urllib.parse.urlsplit(r.headers["location"]).query)["undo"][0]
+    client.post(f"/trash/{undo}/restore", auth=AUTH)
+    client.get("/", auth=AUTH)  # подхват inbox не должен поставить файл второй раз с форматами по умолчанию
+    queued = app.state.store.list("queued")
+    assert len(queued) == 1 and queued[0].format_list == ["cards", "x5"]
+
+
+def test_deleting_failed_job_moves_book_file_to_trash(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer(fail=True))
+    upload(client, "a.pdf")
+    run_queue(app)
+    job = app.state.store.list()[0]
+    assert job.status == "error" and (s.archive / "a.pdf").exists()
+    r = client.post(f"/jobs/{job.id}/delete", auth=AUTH, follow_redirects=False)
+    assert "undo=" in r.headers["location"] and not (s.archive / "a.pdf").exists()
+
+
+def test_deleting_processing_job_says_so(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf")
+    job = app.state.store.claim_next()
+    r = client.post(f"/jobs/{job.id}/delete", auth=AUTH, follow_redirects=False)
+    assert r.headers["location"] == "/?m=inwork" and app.state.store.get(job.id)
+
+
+def test_last_note_takes_book_file_to_trash_and_undo_returns_both(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf", formats=["summary", "key"])
+    run_queue(app)
+    notes = sorted(p.name for p in s.books_dir.glob("*.md"))
+    assert len(notes) == 2 and (s.archive / "a.pdf").exists()
+    client.post(f"/notes/{notes[0]}/delete", auth=AUTH)
+    assert (s.archive / "a.pdf").exists()  # у книги ещё есть заметка
+    r = client.post(f"/notes/{notes[1]}/delete", auth=AUTH, follow_redirects=False)
+    assert not (s.archive / "a.pdf").exists()
+    undo = urllib.parse.parse_qs(urllib.parse.urlsplit(r.headers["location"]).query)["undo"][0]
+    client.post(f"/trash/{undo}/restore", auth=AUTH)
+    assert (s.archive / "a.pdf").exists() and (s.books_dir / notes[1]).exists()
+
+
+def test_encrypted_pdf_rejected_at_upload(tmp_path):
+    from pypdf import PdfReader
+
+    w = PdfWriter()
+    for page in PdfReader(io.BytesIO(PDF)).pages:
+        w.add_page(page)
+    w.encrypt("secret")
+    buf = io.BytesIO()
+    w.write(buf)
+    client, s, _ = make(tmp_path, FakeSummarizer())
+    r = upload(client, "locked.pdf", buf.getvalue())
+    assert "skip=" in r.headers["location"] and "паролем" in client.get(r.headers["location"], auth=AUTH).text
+    assert not any(s.inbox.iterdir())
+
+
+def test_login_limiter_evicts_oldest_instead_of_clearing():
+    lim = LoginLimiter(attempts=2, fail_delay=0)
+    lim.MAX_ADDRESSES = 3
+    lim.fail("victim-attacker")
+    lim.fail("victim-attacker")
+    for i in range(2):
+        lim.fail(f"other{i}")
+    lim.fail("victim-attacker")  # свежая неудача — адрес не вытесняется первым
+    lim.fail("new")
+    assert lim.blocked("victim-attacker") and len(lim._fails) == 3
+
+
+def test_pathological_markdown_renders_fast():
+    import time
+
+    start = time.monotonic()
+    for text in ("> " + "[[" * 20000, "[a " * 30000, "`" * 80000, "![" * 30000):
+        render_note(text)
+    assert time.monotonic() - start < 10
+
+
+def test_heading_in_note_does_not_become_second_h1():
+    _, html = render_note("# Глава\n\n## Часть\n")
+    assert "<h1>" not in html and "<h2>Глава</h2>" in html

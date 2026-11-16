@@ -1,11 +1,14 @@
 """Корзина: удалённые заметки и книги не пропадают сразу.
 
 Каждый удалённый файл лежит в data/trash/<метка>/ вместе с файлом .origin, где записано,
-откуда он. Через TRASH_DAYS дней корзина чистится автоматически (удаление навсегда).
+откуда он. С ним могут лежать связанные файлы (.extra/ и .extra.json — например, файл книги,
+удалённый вместе с её последней заметкой) и .job.json — задача очереди, чтобы «Отменить»
+вернул её с теми же форматами. Через TRASH_DAYS дней корзина чистится автоматически.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 import time
 import uuid
@@ -28,14 +31,35 @@ class Trash:
         self.s = settings
         self.root = settings.trash
 
-    def put(self, path: Path) -> str:
-        """Переносит файл в корзину и возвращает её номер для «Отменить»."""
+    def _rel(self, path: Path) -> str:
+        return str(path.resolve().relative_to(self.s.data_dir.resolve()))
+
+    def put(self, path: Path, *, also: list[Path] | tuple = (), job: dict | None = None) -> str:
+        """Переносит файл (и связанные с ним) в корзину и возвращает её номер для «Отменить»."""
         item_id = time.strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
         box = self.root / item_id
         box.mkdir(parents=True)
-        (box / ".origin").write_text(str(path.resolve().relative_to(self.s.data_dir.resolve())), "utf-8")
+        (box / ".origin").write_text(self._rel(path), "utf-8")
+        if job:
+            (box / ".job.json").write_text(json.dumps(job, ensure_ascii=False), "utf-8")
+        extras = {}
+        for i, extra in enumerate(also):
+            (box / ".extra").mkdir(exist_ok=True)
+            key = f"{i}-{extra.name}"
+            extras[key] = self._rel(extra)
+            shutil.move(str(extra), box / ".extra" / key)
+        if extras:
+            (box / ".extra.json").write_text(json.dumps(extras, ensure_ascii=False), "utf-8")
         shutil.move(str(path), box / path.name)
         return item_id
+
+    def job(self, item_id: str) -> dict | None:
+        """Задача очереди, удалённая вместе с файлом (форматы и т.п.), если она была."""
+        box = self._box(item_id)
+        try:
+            return json.loads((box / ".job.json").read_text("utf-8")) if box else None
+        except (OSError, ValueError):
+            return None
 
     def _box(self, item_id: str) -> Path | None:
         box = (self.root / item_id).resolve()
@@ -48,7 +72,7 @@ class Trash:
         if not self.root.is_dir():
             return out
         for box in sorted(self.root.iterdir(), reverse=True):
-            files = [p for p in box.iterdir() if p.name != ".origin"] if box.is_dir() else []
+            files = [p for p in box.iterdir() if not p.name.startswith(".")] if box.is_dir() else []
             if files and (box / ".origin").is_file():
                 out.append(TrashItem(box.name, files[0].name, (box / ".origin").read_text("utf-8"),
                                      box.stat().st_mtime))
@@ -59,10 +83,25 @@ class Trash:
         box = self._box(item_id)
         if not box:
             return None
-        files = [p for p in box.iterdir() if p.name != ".origin"]
+        files = [p for p in box.iterdir() if not p.name.startswith(".")]
         if not files:
             return None
-        origin = (self.s.data_dir / (box / ".origin").read_text("utf-8")).resolve()
+        dest = self._put_back(files[0], (box / ".origin").read_text("utf-8"))
+        if dest is None:
+            return None
+        try:
+            extras = json.loads((box / ".extra.json").read_text("utf-8"))
+        except (OSError, ValueError):
+            extras = {}
+        for key, origin in extras.items():
+            src = box / ".extra" / key
+            if src.is_file():
+                self._put_back(src, origin)
+        shutil.rmtree(box, ignore_errors=True)
+        return dest
+
+    def _put_back(self, src: Path, rel_origin: str) -> Path | None:
+        origin = (self.s.data_dir / rel_origin).resolve()
         if self.s.data_dir.resolve() not in origin.parents:
             return None
         origin.parent.mkdir(parents=True, exist_ok=True)
@@ -70,8 +109,7 @@ class Trash:
         while dest.exists():
             dest = origin.with_name(f"{origin.stem} ({n}){origin.suffix}")
             n += 1
-        shutil.move(str(files[0]), dest)
-        shutil.rmtree(box, ignore_errors=True)
+        shutil.move(str(src), dest)
         return dest
 
     def purge(self, older_than_days: int | None = None) -> int:

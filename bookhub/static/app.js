@@ -65,7 +65,7 @@ function toast(text, kind = "ok", action = null) {
   if (action) el.append(action); // например, форма «Отменить»
   toastBox.append(el);
   if (!reduce) animate(el, { opacity: [0, 1], y: [16, 0], scale: [0.98, 1] }, { duration: 0.35, ease: EASE });
-  let left = action ? 9000 : 4500;
+  let left = action ? 9000 : kind === "warn" ? 12000 : 4500; // предупреждение успеть прочитать
   let started = Date.now();
   let timer = 0;
   let paused = false;
@@ -116,12 +116,25 @@ function flashToToast() {
   flash.remove();
   const url = new URL(location.href);
   url.searchParams.delete("m");
+  url.searchParams.delete("undo");
   history.replaceState(null, "", url);
 }
 
 // ---------- Загрузка книг с полосой прогресса ----------
 function uploadWithProgress(form, submitter) {
-  const files = [...(form.querySelector("input[type=file]")?.files || [])];
+  const all = [...(form.querySelector("input[type=file]")?.files || [])];
+  const problem = form.bookProblem || (() => "");
+  const files = all.filter((f) => !problem(f));
+  const skipped = all.filter((f) => problem(f)).map((f) => `${f.name} (${problem(f)})`);
+  const data = new FormData(form, submitter);
+  data.delete("files");
+  files.forEach((f) => data.append("files", f, f.name));
+  if (!files.length && !String(data.get("url") || "").trim()) {
+    submitter?.querySelector(".spinner")?.remove();
+    toast(`Нечего загружать: ${skipped.join(", ")}`, "warn");
+    return;
+  }
+  if (skipped.length) data.append("skipped", skipped.join("; "));
   const total = files.reduce((n, f) => n + f.size, 0);
   const box = document.createElement("div");
   box.className = "upload-progress";
@@ -152,7 +165,7 @@ function uploadWithProgress(form, submitter) {
     else fail(xhr.status === 413 ? "Слишком большой файл или слишком много файлов за раз" : `Не удалось загрузить (ошибка ${xhr.status})`);
   });
   xhr.addEventListener("error", () => fail("Не удалось загрузить: нет связи с сервером"));
-  xhr.send(new FormData(form, submitter));
+  xhr.send(data);
 }
 
 // ---------- Формы: подтверждение и защита от двойного нажатия ----------
@@ -258,6 +271,10 @@ function setupDrop(drop) {
   const list = document.querySelector("[data-drop-list]");
   const types = (drop.dataset.types || "").split(",").filter(Boolean);
   const supported = (name) => types.some((t) => name.toLowerCase().endsWith(t) && name.length > t.length);
+  const max = Number(drop.dataset.max) || Infinity;
+  const problem = (f) => (!supported(f.name) ? "формат не поддерживается"
+    : f.size > max ? `больше ${Math.round(max / 1048576)} МБ` : !f.size ? "пустой файл" : "");
+  drop.closest("form").bookProblem = problem; // при отправке такие файлы не загружаем зря
   const render = () => {
     list.replaceChildren();
     for (const f of input.files) {
@@ -268,8 +285,8 @@ function setupDrop(drop) {
       name.textContent = f.name;
       const size = document.createElement("span");
       size.className = "size";
-      size.textContent = supported(f.name) ? humanSize(f.size) : "формат не поддерживается";
-      if (!supported(f.name)) li.className = "bad";
+      size.textContent = problem(f) || humanSize(f.size);
+      if (problem(f)) li.className = "bad";
       li.append(name, size);
       list.append(li);
     }

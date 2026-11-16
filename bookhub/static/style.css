@@ -100,7 +100,7 @@
     --muted: #9aa3ad;
     --line: #2b3036;
     --pen: #6aa6e0;
-    --btn-hover: #4a88c8;
+    --btn-hover: #2f66a0;
     --link: #8fbdf0;
     --field: #6b7480;
     --pen-wash: #1d2d40;
@@ -362,6 +362,8 @@ main {
 .flash.warn { background: var(--orange-wash); color: var(--orange-ink); }
 div.flash { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); }
 div.flash form { margin: 0; }
+/* «Нет связи» видно, даже если очередь прокручена далеко вниз */
+.flash.offline:not([hidden]) { position: sticky; top: var(--space-3); z-index: 20; box-shadow: 0 4px 16px rgb(0 0 0 / .12); }
 .status { margin: 0; display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-6); font-size: var(--fs-sm); }
 .status dt, .status dd { display: inline; margin: 0; }
 .status dt { color: var(--muted); }

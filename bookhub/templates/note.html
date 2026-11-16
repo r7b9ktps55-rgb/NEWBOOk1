@@ -1,9 +1,14 @@
 {% extends "base.html" %}
 {% from "_formats.html" import picker %}
 {% from "_icons.html" import icon %}
-{% block title %}{{ heading }} — Book Hub{% endblock %}
+{% block title %}{{ heading }} · {{ format_label|lower }} — Book Hub{% endblock %}
 {% block nav %}<div class="nav-links"><a href="/#library">Библиотека</a></div>{% endblock %}
 {% block content %}
+{% if message %}
+<div class="flash {{ message_kind }}" role="status" data-flash="{{ message_kind }}">
+  <span>{{ message }}</span>
+</div>
+{% endif %}
 <article class="reader">
   <a href="/#library" class="back">← Библиотека</a>
   {% if book and book.notes|length > 1 %}
@@ -24,12 +29,13 @@
       <button class="btn icon" aria-label="Удалить заметку">{{ icon("trash") }}</button>
     </form>
   </div>
+  {% if not obsidian_uri %}<p class="hint">Заметка слишком длинная для кнопки «В Obsidian» — скачайте .md и положите в хранилище или скопируйте текст.</p>{% endif %}
   {% if props %}<dl class="props">{% for k, v in props %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl>{% endif %}
   <div class="prose">{{ html|safe }}</div>
 </article>
 
 {% if book and book.formats|length < formats|length %}
-<details class="card more reader">
+<details class="card more reader" id="more" {% if message_kind == "warn" %}open{% endif %}>
   <summary>Сделать из этой книги ещё…</summary>
   <form action="/notes/{{ name|urlencode }}/more" method="post" data-busy-form>
     {{ picker(formats, (), book.formats) }}
