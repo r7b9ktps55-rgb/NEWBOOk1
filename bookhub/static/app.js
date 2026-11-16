@@ -378,6 +378,7 @@ function setupLive(root) {
   let version = root.dataset.version;
   let libVersion = root.dataset.libVersion;
   let notes = Number(root.dataset.notes || 0);
+  let errors = Number(root.dataset.errors || 0);
   let active = Number(root.dataset.active || 0);
   let busy = root.dataset.busy === "1";
   let timer = 0;
@@ -442,6 +443,11 @@ function setupLive(root) {
           if (doneToast?.isConnected) doneToast.update(text);
           else doneToast = toast(text);
         }
+        if (d.errors > errors) {
+          const n = d.errors - errors;
+          toast(`${n} ${plural(n, "книгу", "книги", "книг")} не удалось обработать — причина в очереди`, "warn");
+        }
+        errors = d.errors;
         notes = d.notes;
         active = d.active;
         busy = d.busy;

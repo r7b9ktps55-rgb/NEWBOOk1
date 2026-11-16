@@ -37,10 +37,19 @@ ZIP_MAGIC = b"PK\x03\x04"
 MIN_TEXT = 200
 MAX_MEMBER = 128 * 1024 * 1024    # один файл внутри EPUB/DOCX/FB2.ZIP после распаковки
 MAX_UNPACKED = 512 * 1024 * 1024  # все главы EPUB вместе
+# Разбор HTML/XML занимает в памяти в десятки раз больше самого текста: плотная глава в 128 МБ
+# потребовала бы гигабайты. Настоящие главы — сотни килобайт, книги FB2 — единицы мегабайт.
+MAX_HTML = 8 * 1024 * 1024
+MAX_XML = 64 * 1024 * 1024
+MAX_DJVU_PDF = 2 * 1024 * 1024 * 1024
 
 
 class ExtractError(Exception):
     pass
+
+
+class TooLarge(ExtractError):
+    """Часть книги слишком велика для безопасного разбора — книгу не пропускаем молча."""
 
 
 @dataclass
@@ -131,6 +140,8 @@ def _local(tag) -> str:
 def _xml(data: bytes):
     from lxml import etree
 
+    if len(data) > MAX_XML:
+        raise TooLarge(f"XML внутри книги слишком большой для разбора (больше {MAX_XML // 1048576} МБ)")
     parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=True, huge_tree=True)
     root = etree.fromstring(data, parser)
     if root is None:
@@ -142,10 +153,21 @@ BLOCKS = {"p", "div", "li", "tr", "blockquote", "section", "article", "pre", "dd
 HEADINGS = {"h1": "#", "h2": "##", "h3": "###", "h4": "###", "h5": "###", "h6": "###"}
 
 
+def _is_note_mark(el) -> bool:
+    """Номер сноски или обратная ссылка из сноски («↩︎»)."""
+    text = (el.text_content() or "").strip()
+    if _local(el.tag) == "sup":
+        return bool(re.fullmatch(r"\d{1,3}", text))
+    marks = " ".join(f"{k}={v}" for k, v in el.attrib.items())
+    return bool(re.search(r"footnote|noteref|backlink|doc-noteref", marks)) and (text.isdigit() or text in ("↩", "↩︎", ""))
+
+
 def html_to_text(data: bytes) -> str:
     """HTML/XHTML → текст с абзацами и заголовками Markdown."""
     from lxml import html as lhtml
 
+    if len(data) > MAX_HTML:
+        raise TooLarge(f"Глава книги слишком большая для разбора (больше {MAX_HTML // 1048576} МБ текста)")
     # Кодировку определяем сами: без объявления lxml читает документ как latin-1.
     markup = re.sub(r"^\s*<\?xml[^>]*\?>", "", decode(data))
     if not markup.strip():
@@ -161,16 +183,29 @@ def html_to_text(data: bytes) -> str:
             el.text = re.sub(r"\s+", " ", el.text)
         if el.tail:
             el.tail = re.sub(r"\s+", " ", el.tail)
-    for el in doc.iter():
+    for el in list(doc.iter()):  # список: ниже из дерева удаляются элементы
         name = _local(el.tag)
         if name in HEADINGS:
             el.text = f"\n\n{HEADINGS[name]} " + (el.text or "")
             el.tail = "\n\n" + (el.tail or "")
+        elif name == "li":
+            el.text = "- " + (el.text or "").lstrip()
+            el.tail = "\n\n" + (el.tail or "")
+        elif name in ("td", "th"):
+            el.tail = " | " + (el.tail or "")
+        elif name == "tr":
+            el.tail = "\n" + (el.tail or "")
+        elif name in ("sup", "a") and _is_note_mark(el):
+            number = el.text_content().strip()
+            # Номер сноски — в скобках, чтобы не прилип к слову; «↩︎» обратной ссылки не нужен.
+            el.text = f"[{number}]" if number.isdigit() else ""
+            for child in list(el):
+                el.remove(child)
         elif name in BLOCKS:
             el.tail = "\n\n" + (el.tail or "")
         elif name == "br":
             el.tail = "\n" + (el.tail or "")
-    text = doc.text_content()
+    text = re.sub(r" *\| *(?=\n|$)", "", doc.text_content())  # «|» после последней ячейки строки
     # заголовок без текста («## » на отдельной строке) не нужен
     return clean(re.sub(r"^#+ *$", "", text, flags=re.M))
 
@@ -216,6 +251,8 @@ def read_epub(path: Path) -> Extracted:
                     data = _read_member(z, href, budget)  # слишком большая книга — ошибка, а не пропуск
                     try:
                         chapters.append(html_to_text(data))
+                    except TooLarge:
+                        raise
                     except ExtractError:
                         log.warning("Пропущена глава EPUB %s", href)
     return Extracted(clean("\n\n".join(c for c in chapters if c)), title, author)
@@ -258,6 +295,11 @@ def read_fb2(path: Path) -> Extracted:
                     out.append(text_of(child))
             elif name in ("poem", "stanza", "cite", "epigraph", "annotation"):
                 walk(child, depth)
+            elif name == "table":
+                rows = [" | ".join(text_of(c) for c in tr if _local(c.tag) in ("td", "th"))
+                        for tr in child if _local(tr.tag) == "tr"]
+                if any(rows):
+                    out.append("\n".join(r for r in rows if r))
 
     for body in (el for el in root if _local(el.tag) == "body"):
         if body.get("name") in ("notes", "comments"):
@@ -269,20 +311,46 @@ def read_fb2(path: Path) -> Extracted:
 def read_docx(path: Path) -> Extracted:
     try:
         with zipfile.ZipFile(path) as z:
+            names = z.namelist()
             root = _xml(_read_member(z, "word/document.xml"))
-            core = _xml(_read_member(z, "docProps/core.xml")) if "docProps/core.xml" in z.namelist() else None
+            core = _xml(_read_member(z, "docProps/core.xml")) if "docProps/core.xml" in names else None
+            notes = _xml(_read_member(z, "word/footnotes.xml")) if "word/footnotes.xml" in names else None
     except (zipfile.BadZipFile, KeyError) as exc:
         raise ExtractError("Файл DOCX повреждён") from exc
-    out = []
-    for p in root.iter():
-        if _local(p.tag) != "p":
-            continue
-        text = "".join(t.text or "" for t in p.iter() if _local(t.tag) == "t").strip()
-        if not text:
-            continue
-        style = next((v for s in p.iter() if _local(s.tag) == "pstyle"
-                      for k, v in s.attrib.items() if _local(k) == "val"), "")
-        out.append(f"## {text}" if re.match(r"(heading|title|заголовок)", style, re.I) else text)
+
+    def para_text(p) -> str:
+        return "".join(t.text or "" for t in p.iter() if _local(t.tag) == "t").strip()
+
+    def paragraphs(tree) -> list[str]:
+        out = []
+        for p in tree.iter():
+            if _local(p.tag) == "tbl":
+                rows = []
+                for tr in (x for x in p.iter() if _local(x.tag) == "tr"):
+                    cells = [" ".join(para_text(q) for q in tc.iter() if _local(q.tag) == "p").strip()
+                             for tc in tr if _local(tc.tag) == "tc"]
+                    rows.append(" | ".join(cells))
+                if any(rows):
+                    out.append("\n".join(r for r in rows if r.strip(" |")))
+                continue
+            if _local(p.tag) != "p" or any(_local(a.tag) == "tbl" for a in p.iterancestors()):
+                continue
+            text = para_text(p)
+            if not text:
+                continue
+            style = next((v for s in p.iter() if _local(s.tag) == "pstyle"
+                          for k, v in s.attrib.items() if _local(k) == "val"), "")
+            if re.match(r"(heading|title|заголовок)", style, re.I):
+                text = f"## {text}"
+            elif any(_local(x.tag) == "numpr" for x in p.iter()):
+                text = f"- {text}"  # пункт списка
+            out.append(text)
+        return out
+
+    out = paragraphs(root)
+    footnotes = paragraphs(notes) if notes is not None else []
+    if footnotes:
+        out += ["## Сноски", *footnotes]
     title = author = ""
     if core is not None:
         for el in core.iter():
@@ -298,7 +366,9 @@ def read_html(path: Path) -> Extracted:
     data = path.read_bytes()
     m = re.search(rb"<title[^>]*>(.*?)</title>", data, re.I | re.S)
     title = clean(re.sub(r"<[^>]+>", "", decode(m.group(1)))) if m else ""
-    return Extracted(html_to_text(data), title)
+    a = re.search(rb"<meta[^>]+name=[\"']?(?:author|dc\.creator)[\"']?[^>]*content=[\"']([^\"']+)", data, re.I)
+    author = clean(decode(a.group(1))) if a else ""
+    return Extracted(html_to_text(data), title, author)
 
 
 def read_text_file(path: Path) -> Extracted:

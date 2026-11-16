@@ -302,6 +302,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         summarizer.max_requests = s.max_requests_per_job
         summarizer.meter = proc.take_request
         summarizer.plan_check = proc.check_plan
+        summarizer.parts_dir = s.cache / "parts"
     if s.daily_request_limit and s.max_requests_per_job > s.daily_request_limit:
         log.warning("MAX_REQUESTS_PER_JOB (%d) больше DAILY_REQUEST_LIMIT (%d): такие книги не уложатся в сутки",
                     s.max_requests_per_job, s.daily_request_limit)
@@ -355,6 +356,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     templates = Jinja2Templates(directory=HERE / "templates")
     templates.env.globals["asset_v"] = static_version(HERE / "static")
     templates.env.filters["when"] = lambda value: human_when(value, s.tz)
+    templates.env.globals["max_requests"] = s.max_requests_per_job
 
     app.add_middleware(SecurityHeaders)
 
@@ -392,7 +394,11 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     @app.exception_handler(Exception)
     async def server_error(request: Request, exc: Exception):
         log.exception("Необработанная ошибка на %s", request.url.path)
-        return error_page(request, 500, "Ошибка на сервере. Подробности — в журнале (docker compose logs).")
+        # Ответ 500 собирается снаружи SecurityHeaders — заголовки безопасности ставим сами.
+        return error_page(request, 500, "Что-то сломалось на сервере. Попробуйте ещё раз; если повторится — "
+                          "подробности есть в журнале сервера.", headers={
+                              "Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff",
+                              "Referrer-Policy": "same-origin", "Cache-Control": "no-store"})
 
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     # Добавляется последним, значит срабатывает первым: до разбора формы и записи файлов.
@@ -410,7 +416,11 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         # Защита от CSRF: формы принимаем только со своего же сайта.
         if request.method == "POST":
             origin = request.headers.get("origin")
-            if origin and urllib.parse.urlsplit(origin).netloc != request.headers.get("host"):
+            try:
+                foreign = bool(origin) and urllib.parse.urlsplit(origin).netloc != request.headers.get("host")
+            except ValueError:  # испорченный заголовок («http://[») — тоже чужой
+                foreign = True
+            if foreign:
                 raise HTTPException(403, "Запрос с чужого сайта")
         return s.web_user
 
@@ -452,7 +462,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         checks["queue"] = not any(j.updated_at < stale for j in store.list("processing")) if checks["db"] else False
         return checks
 
-    @app.get("/health")
+    @app.api_route("/health", methods=["GET", "HEAD"])
     async def health():
         """Для Docker: 503, если база недоступна, диск почти заполнен или задача зависла."""
         checks = await asyncio.to_thread(health_checks)
@@ -485,6 +495,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             "books": books,
             "busy": busy,
             "notes_total": sum(len(b.notes) for b in books),
+            "errors": sum(1 for j in active if j.status == "error"),
             "lib_version": lib_version,
             "version": hashlib.sha1((queue_sig + lib_version + str(git.last_error) + str(today_requests)
                                      + str(last_daily)).encode()).hexdigest()[:12],
@@ -527,6 +538,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             "active": len(state["active"]),
             "busy": state["busy"],
             "notes": state["notes_total"],
+            "errors": state["errors"],
             "queue": queue_html,
             "library": library_html,
         })
@@ -673,7 +685,8 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     @app.get("/notes/{name}/download")
     async def download(name: str, _: str = Depends(auth)):
         path = note_path(name)
-        return FileResponse(path, filename=path.name, media_type="text/markdown; charset=utf-8")
+        return FileResponse(path, filename=path.name, media_type="text/markdown; charset=utf-8",
+                            headers={"Cache-Control": "no-store"})  # не оставлять копию в кэше браузера
 
     def sync_later(message: str) -> None:
         if git.enabled:
@@ -732,13 +745,15 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
                 for p in sorted(s.books_dir.glob("*.md")):
-                    z.write(p, f"{s.vault_subfolder or 'Books'}/{p.name}")
+                    # Как в хранилище: в подпапке, а без подпапки — в корне архива.
+                    z.write(p, f"{s.vault_subfolder}/{p.name}" if s.vault_subfolder else p.name)
             return buf.getvalue()
 
         data = await asyncio.to_thread(build)
         stamp = datetime.now(s.tz).strftime("%Y-%m-%d")
         return Response(data, media_type="application/zip",
-                        headers={"Content-Disposition": f'attachment; filename="bookhub-notes-{stamp}.zip"'})
+                        headers={"Content-Disposition": f'attachment; filename="bookhub-notes-{stamp}.zip"',
+                                 "Cache-Control": "no-store"})
 
     app.state.store, app.state.processor, app.state.git, app.state.limiter = store, proc, git, limiter
     app.state.trash, app.state.notifier = trash, notifier

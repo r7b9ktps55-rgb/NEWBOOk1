@@ -1,17 +1,25 @@
 {% from "_icons.html" import icon %}
 {% macro chip(f, checked) -%}
-<label class="chip" title="{{ f.hint }}"><input type="checkbox" name="formats" value="{{ f.id }}" {% if f.id in checked %}checked{% endif %}><span>{{ icon("check", "tick") }}{{ f.label }}</span></label>
+<label class="chip" title="{{ f.hint }}"><input type="checkbox" name="formats" value="{{ f.id }}" {% if f.id in checked %}checked{% endif %}><span>{{ icon("check", "tick") }}{{ f.label }}<span class="visually-hidden">: {{ f.hint }}</span></span></label>
 {%- endmacro %}
 {% macro picker(formats, checked=(), exclude=()) %}
-<fieldset class="formats">
-  <legend class="caps">Разбор</legend>
-  <div class="chips">
-    {% for f in formats.values() if not f.ratio and f.id not in exclude %}{{ chip(f, checked) }}{% endfor %}
-  </div>
-  <p class="caps">Сжатый пересказ</p>
-  <div class="chips">
-    {% for f in formats.values() if f.ratio and f.id not in exclude %}{{ chip(f, checked) }}{% endfor %}
-  </div>
-  <p class="hint">Сжатие идёт частями (~20 страниц на запрос), поэтому для толстой книги это много запросов к Gemini.</p>
-</fieldset>
+<div class="formats">
+  <fieldset>
+    <legend class="caps">Что сделать из книги</legend>
+    <div class="chips">
+      {% for f in formats.values() if not f.ratio and f.id not in exclude %}{{ chip(f, checked) }}{% endfor %}
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend class="caps">Сжатый пересказ</legend>
+    <div class="chips">
+      {% for f in formats.values() if f.ratio and f.id not in exclude %}{{ chip(f, checked) }}{% endfor %}
+    </div>
+  </fieldset>
+  <p class="hint">Сжатие идёт частями (~6000 слов или 20 страниц на запрос): книга в 100 тыс. слов — около 17 запросов на каждый вид сжатия.{% if max_requests %} Не больше {{ max_requests }} запросов на книгу — иначе книга получит ошибку, ничего не потратив.{% endif %}</p>
+  <details class="hint formats-help">
+    <summary>Что означают форматы</summary>
+    <dl>{% for f in formats.values() if f.id not in exclude %}<dt>{{ f.label }}</dt><dd>{{ f.hint }}</dd>{% endfor %}</dl>
+  </details>
+</div>
 {% endmacro %}

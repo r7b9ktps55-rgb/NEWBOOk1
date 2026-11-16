@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
@@ -25,6 +27,7 @@ CHUNK_MAX_PAGES = 30
 SCAN_WORDS_PER_PAGE = 300  # оценка для сканов, где текст не извлекается
 INLINE_LIMIT = 18 * 1024 * 1024
 RETRY_DELAYS = (15, 45, 90)
+RETRY_CODES = (408, 429, 500, 502, 503, 504)
 GEMINI_TIMEOUT_MS = 10 * 60 * 1000  # зависший запрос не должен держать очередь вечно
 MAX_NAME_BYTES = 180  # файловые системы допускают 255 байт на имя; оставляем место для суффиксов
 
@@ -46,17 +49,19 @@ class NotEnoughToday(DailyLimitReached):
 @dataclass
 class Summary:
     fmt: str
-    book: str  # «Название - Автор» — общее имя для всех форматов книги
+    book: str  # «Название - Автор» — общее имя для всех форматов книги (безопасное для имени файла)
     markdown: str
     extra: dict | None = None  # дополнительные поля во frontmatter
+    shown: str = ""  # то же без чистки для файловой системы («C#: Том 1») — для frontmatter
 
     @property
     def title(self) -> str:
-        return self.book.rsplit(" - ", 1)[0].strip() or self.book
+        name = self.shown or self.book
+        return name.rsplit(" - ", 1)[0].strip() or name
 
     @property
     def author(self) -> str:
-        parts = self.book.rsplit(" - ", 1)
+        parts = (self.shown or self.book).rsplit(" - ", 1)
         return parts[1].strip() if len(parts) == 2 else "Неизвестно"
 
 
@@ -66,7 +71,17 @@ class Summarizer(Protocol):
 
 
 _BAD_CHARS = re.compile(r'[\\/*?:"<>|\x00-\x1f#^\[\]]')
-_BIDI = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+# Невидимые и управляющие символы: направление текста, нулевой ширины, DEL и C1, разделители строк.
+_BIDI = re.compile("[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\x7f-\x9f\u2028\u2029]")
+UNKNOWN = "Неизвестно"
+
+
+def clean_text(value: str) -> str:
+    """Для свойств заметки: без управляющих и невидимых символов, но со всеми знаками («C#: Том 1»)."""
+    value = unicodedata.normalize("NFC", value)
+    value = re.sub("[\x00-\x1f\x85\u2028\u2029]", " ", value)  # переводы строк — в пробелы
+    value = _BIDI.sub("", value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def safe_filename(name: str, fallback: str = "Без названия", limit: int = 100) -> str:
@@ -83,23 +98,51 @@ def safe_filename(name: str, fallback: str = "Без названия", limit: i
     return cleaned or fallback
 
 
-def parse_output(text: str, fallback: str) -> tuple[str, str]:
-    """Возвращает (имя книги из строки FILENAME, остальной текст)."""
+def book_name(raw: str, fallback: str = "Без названия") -> str:
+    """«Название - Автор» для имени файла: название и автор укорачиваются по отдельности,
+    чтобы длинное название не съело автора."""
+    raw = clean_text(raw)
+    title, sep, author = raw.rpartition(" - ")
+    if not sep or not title.strip():
+        return safe_filename(raw, fallback)
+    title = safe_filename(title, fallback)
+    author = safe_filename(author, UNKNOWN, limit=60)
+    return f"{title} - {author}"
+
+
+def _known(raw: str, fallback: str) -> str:
+    """Если модель не узнала ни названия, ни автора, берём имя из метаданных или файла."""
+    title, _, author = clean_text(raw).rpartition(" - ")
+    if title.strip() in ("", UNKNOWN) and author.strip() in ("", UNKNOWN):
+        return fallback
+    return raw
+
+
+def parse_output_full(text: str, fallback: str) -> tuple[str, str, str]:
+    """(имя для файла, имя как есть для свойств, остальной текст)."""
     text = text.strip()
     # Иногда модель всё же оборачивает ответ в ```markdown ... ```
     fence = re.fullmatch(r"```[a-zA-Z]*\n(.*)\n```", text, flags=re.S)
     if fence:
         text = fence.group(1).strip()
-    lines = text.splitlines()
-    if lines:
-        first = lines[0].strip().strip("*").strip()
-        if first.upper().startswith("FILENAME:"):
-            name = safe_filename(first.split(":", 1)[1].strip().strip("*"), fallback)
-            return name, "\n".join(lines[1:]).strip() + "\n"
-    return safe_filename(fallback), text + "\n"
+    # Только «\n»: splitlines() резал бы и по U+2028/NEL внутри строки FILENAME.
+    lines = text.replace("\r\n", "\n").split("\n")
+    first = lines[0].strip().strip("*").strip()
+    if first.upper().startswith("FILENAME:"):
+        raw = _known(first.split(":", 1)[1].strip().strip("*"), fallback)
+        return book_name(raw, safe_filename(fallback)), clean_text(raw), "\n".join(lines[1:]).strip() + "\n"
+    return book_name(fallback), clean_text(fallback), text + "\n"
+
+
+def parse_output(text: str, fallback: str) -> tuple[str, str]:
+    """Возвращает (имя книги из строки FILENAME, остальной текст)."""
+    name, _, body = parse_output_full(text, fallback)
+    return name, body
 
 
 def _yaml(value) -> str:
+    if isinstance(value, date):
+        return value.isoformat()
     if isinstance(value, list):
         return "[" + ", ".join(value) + "]"
     if isinstance(value, int):
@@ -186,6 +229,8 @@ class GeminiSummarizer:
         self.max_requests = max_requests  # потолок запросов на одну книгу (0 — без потолка)
         self.meter = meter  # вызывается перед каждым запросом; бросает DailyLimitReached
         self.plan_check: Callable[[int], None] | None = None  # проверка плана до первого запроса
+        # Готовые части сжатия: если книга упадёт на середине, «Повторить» не оплачивает их заново.
+        self.parts_dir: Path | None = None
 
     # ----- промпты -----
     def prompt(self, fmt: str) -> str:
@@ -206,8 +251,8 @@ class GeminiSummarizer:
                 break
             except Exception as exc:
                 code = getattr(exc, "code", None)
-                if code in (429, 500, 502, 503, 504) and attempt < len(RETRY_DELAYS):
-                    log.warning("Gemini %s, повтор через %s с", code, RETRY_DELAYS[attempt])
+                if (code in RETRY_CODES or is_network_error(exc)) and attempt < len(RETRY_DELAYS):
+                    log.warning("Gemini: %s, повтор через %s с", code or exc.__class__.__name__, RETRY_DELAYS[attempt])
                     self.sleep(RETRY_DELAYS[attempt])
                     continue
                 raise
@@ -252,6 +297,7 @@ class GeminiSummarizer:
         is_pdf = kind != "url" and Path(source).suffix.lower() == ".pdf"
         material: object = None
         text = ""
+        shown = ""
 
         if kind == "url":
             progress("скачиваю страницу")
@@ -265,6 +311,10 @@ class GeminiSummarizer:
             text = book_file.text
             fallback = (f"{book_file.title} - {book_file.author}" if book_file.title and book_file.author
                         else book_file.title or split_name(Path(source).name)[0])
+            if book_file.title and book_file.author and not book:
+                # Метаданные точнее догадки модели — и сжатие (оно видит только кусок текста) их не теряет.
+                book = book_name(fallback)
+                shown = clean_text(fallback)
             material = "\n".join(x for x in (f"Книга (файл {Path(source).name}).", book_file.hint) if x)
             material += "\n\n" + text[:MAX_BOOK_TEXT]
 
@@ -274,7 +324,7 @@ class GeminiSummarizer:
         planned = len(whole) + parts * len(squeeze)
         if self.max_requests and planned > self.max_requests:
             raise SummaryError(
-                f"Для этой книги нужно {planned} запросов к Gemini — больше лимита {self.max_requests} "
+                f"Для этой книги нужно {planned} {requests_word(planned)} к Gemini — больше лимита {self.max_requests} "
                 "на одну книгу (MAX_REQUESTS_PER_JOB). Уберите сжатие или увеличьте лимит."
             )
         if self.plan_check:
@@ -289,9 +339,10 @@ class GeminiSummarizer:
             try:
                 for fmt in whole:
                     progress(FORMATS[fmt].label)
-                    name, body = parse_output(self._generate([material, self.prompt(fmt)]), fallback)
-                    book = book or name
-                    yield Summary(fmt, book, body)
+                    name, raw, body = parse_output_full(self._generate([material, self.prompt(fmt)]), fallback)
+                    if not book:
+                        book, shown = name, raw
+                    yield Summary(fmt, book, body, shown=shown)
             finally:
                 if up is not None:
                     self._forget(up)
@@ -301,18 +352,27 @@ class GeminiSummarizer:
                 summary = self._compress_pdf(layout, fmt, book, fallback, progress)
             else:
                 summary = self._compress_text(text, fmt, book, fallback, progress)
-            book = summary.book
+            summary.shown = summary.shown or shown
+            book, shown = summary.book, summary.shown
             yield summary
 
     # ----- сжатие частями -----
     def _compress(self, parts: list[tuple[object, int]], fmt: str, book: str | None, fallback: str,
                   progress: Progress) -> Summary:
         ratio = FORMATS[fmt].ratio
-        out = []
+        out, shown, saved = [], "", []
         for i, (content, words) in enumerate(parts):
             progress(f"{FORMATS[fmt].label}: часть {i + 1} из {len(parts)}")
             target = max(60, round(words / ratio))
             prompt = compress_prompt(ratio, target, i + 1, len(parts), i == 0, book)
+            cached = self._part_path(content, prompt)
+            if cached and cached.is_file():
+                text = cached.read_text("utf-8")
+                saved.append(cached)
+                if i == 0 and not book:
+                    book, shown, text = parse_output_full(text, fallback)
+                out.append(text.strip())
+                continue
             uploaded = None
             if isinstance(content, bytes):
                 if len(content) <= INLINE_LIMIT:
@@ -327,15 +387,28 @@ class GeminiSummarizer:
             finally:
                 if uploaded is not None:
                     self._forget(uploaded)
+            if cached:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                cached.write_text(text, "utf-8")
+                saved.append(cached)
             if i == 0 and not book:
-                book, text = parse_output(text, fallback)
+                book, shown, text = parse_output_full(text, fallback)
             out.append(text.strip())
+        for path in saved:  # формат готов — сохранённые части больше не нужны
+            path.unlink(missing_ok=True)
         source_words = sum(w for _, w in parts)
         result_words = sum(len(t.split()) for t in out)
         intro = (f"> [!info] {FORMATS[fmt].label}\n> Оригинал ≈ {source_words:,} слов → пересказ ≈ {result_words:,} слов"
                  .replace(",", " "))
-        return Summary(fmt, book or safe_filename(fallback), intro + "\n\n" + "\n\n".join(out) + "\n",
-                       {"source_words": source_words, "words": result_words})
+        return Summary(fmt, book or book_name(fallback), intro + "\n\n" + "\n\n".join(out) + "\n",
+                       {"source_words": source_words, "words": result_words}, shown=shown)
+
+    def _part_path(self, content: object, prompt: str) -> Path | None:
+        if not self.parts_dir:
+            return None
+        h = hashlib.sha256(self.model.encode() + b"\0" + prompt.encode())
+        h.update(content if isinstance(content, bytes) else str(content).encode())
+        return self.parts_dir / f"{h.hexdigest()[:32]}.txt"
 
     def _pdf_layout(self, path: Path, progress: Progress) -> PdfLayout:
         from pypdf import PdfReader
@@ -374,12 +447,32 @@ class GeminiSummarizer:
         return self._compress(parts, fmt, book, fallback, progress)
 
 
+def requests_word(n: int) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return "запросов"
+    return {1: "запрос", 2: "запроса", 3: "запроса", 4: "запроса"}.get(n % 10, "запросов")
+
+
+def is_network_error(exc: BaseException) -> bool:
+    """Обрыв связи или таймаут (httpx/httpcore, сокеты): такой запрос стоит повторить."""
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    for cls in type(exc).__mro__:
+        if cls.__module__.split(".")[0] in ("httpx", "httpcore") and cls.__name__ in (
+                "TransportError", "TimeoutException", "NetworkError", "RemoteProtocolError",
+                "ConnectError", "ReadError", "WriteError", "ReadTimeout", "ConnectTimeout", "PoolTimeout"):
+            return True
+    return False
+
+
 def fetch_article(url: str) -> tuple[str, str]:
     import trafilatura
 
     html = trafilatura.fetch_url(url)
     if not html:
-        raise SummaryError("Не удалось скачать страницу")
+        raise SummaryError("Не удалось скачать страницу: сайт недоступен, требует входа или не пускает "
+                           "программы — сохраните статью как HTML и загрузите файлом")
     text = trafilatura.extract(html) or ""
     if len(text) < 200:
         raise SummaryError("Не удалось извлечь текст со страницы (меньше 200 символов)")

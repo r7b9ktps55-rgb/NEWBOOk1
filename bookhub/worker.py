@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -21,7 +22,7 @@ from .gitsync import GitSync
 from .notify import Notifier
 from .store import Job, JobStore
 from .summarizer import (MAX_NAME_BYTES, DailyLimitReached, NotEnoughToday, Summarizer, Summary, SummaryError,
-                         safe_filename, with_frontmatter)
+                         is_network_error, requests_word, safe_filename, with_frontmatter)
 from .trash import Trash
 
 log = logging.getLogger(__name__)
@@ -30,12 +31,41 @@ CACHE_DAYS = 30
 
 
 def unique_path(folder: Path, stem: str, suffix: str) -> Path:
+    """Свободное имя. Регистр не различаем: на Windows и macOS «Книга.md» и «книга.md» — один файл,
+    и при распаковке ZIP или синхронизации одна заметка затёрла бы другую."""
+    taken = {p.name.casefold() for p in folder.iterdir()} if folder.is_dir() else set()
     path = folder / f"{stem}{suffix}"
     n = 2
-    while path.exists():
+    while path.exists() or path.name.casefold() in taken:
         path = folder / f"{stem} ({n}){suffix}"
         n += 1
     return path
+
+
+def human_error(exc: BaseException) -> str:
+    """Понятное пользователю объяснение ошибки (подробности остаются в журнале)."""
+    from .extract import ExtractError
+
+    text = str(exc)
+    if text and (isinstance(exc, (SummaryError, ExtractError)) or re.search("[а-яё]", text, re.I)):
+        return text[:500]  # сообщения на русском и так написаны для людей
+    if is_network_error(exc):
+        return "Нет связи с Gemini (обрыв соединения или таймаут) — нажмите «Повторить» позже"
+    name = type(exc).__name__
+    if name == "FileNotDecryptedError":
+        return "PDF защищён паролем — снимите защиту и загрузите снова"
+    code = getattr(exc, "code", None)
+    if code in (401, 403):
+        return "Gemini не принял ключ — проверьте GEMINI_API_KEY и доступ из этой страны"
+    if code == 429:
+        return "Gemini: исчерпана квота ключа — нажмите «Повторить» позже"
+    if isinstance(code, int) and code >= 500:
+        return "Gemini временно недоступен — нажмите «Повторить» позже"
+    if isinstance(code, int) and code >= 400:
+        return f"Gemini отклонил запрос (код {code}) — подробности в журнале сервера"
+    if isinstance(exc, MemoryError):
+        return "Не хватило памяти для разбора этой книги"
+    return "Непредвиденная ошибка при разборе — подробности в журнале сервера"
 
 
 def fit_bytes(text: str, max_bytes: int) -> str:
@@ -86,12 +116,13 @@ class Processor:
             return
         if planned > limit:
             raise SummaryError(
-                f"Для этой книги нужно {planned} запросов к Gemini — больше дневного лимита {limit} "
+                f"Для этой книги нужно {planned} {requests_word(planned)} к Gemini — больше дневного лимита {limit} "
                 "(DAILY_REQUEST_LIMIT). Увеличьте лимит или уберите сжатие."
             )
         left = limit - self.store.requests_on(self.today())
         if planned > left:
-            raise NotEnoughToday(f"Сегодня осталось {max(0, left)} запросов к Gemini, а книге нужно {planned}")
+            left = max(0, left)
+            raise NotEnoughToday(f"Сегодня осталось {left} {requests_word(left)} к Gemini, а книге нужно {planned}")
 
     def take_request(self) -> None:
         """Счётчик запросов к Gemini: вызывается перед каждым запросом."""
@@ -258,7 +289,7 @@ class Processor:
         except Exception as exc:  # ошибка одной книги не должна ронять очередь
             log.exception("Ошибка обработки задачи %s", job.id)
             done = f" (готово: {len(written)})" if written else ""
-            message = (str(exc) or exc.__class__.__name__) + done
+            message = human_error(exc) + done
             self.store.mark_error(job.id, message)
             self.notifier.send(f"не удалось обработать «{job.book or job.title}»: {message}")
         return written, False
@@ -269,9 +300,9 @@ class Processor:
             "author": summary.author,
             "book": summary.book,
             "format": summary.fmt,
-            "tags": ["book", f"book/{summary.fmt}"],
+            "tags": ["book", f"book/{summary.fmt}"] + (["flashcards"] if summary.fmt == "cards" else []),
             "status": "unread",
-            "created": datetime.now(self.s.tz).strftime("%Y-%m-%d"),
+            "created": datetime.now(self.s.tz).date(),  # дата без кавычек — тип «дата» в Obsidian
             "source": source,
             **(summary.extra or {}),
         }
@@ -310,5 +341,10 @@ class Processor:
             source = self.s.archive / pdf.name[: -len(".pdf")]
             if not source.exists() or pdf.stat().st_mtime < limit:
                 pdf.unlink(missing_ok=True)
+                removed += 1
+        # Части сжатия от упавших книг (после успеха они удаляются сразу)
+        for part in (self.s.cache / "parts").glob("*.txt"):
+            if part.stat().st_mtime < limit:
+                part.unlink(missing_ok=True)
                 removed += 1
         return removed

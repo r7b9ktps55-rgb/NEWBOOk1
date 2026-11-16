@@ -1,5 +1,6 @@
 import asyncio
 import io
+import re
 import sqlite3
 import subprocess
 import urllib.parse
@@ -18,6 +19,8 @@ from bookhub.main import create_app, render_note
 from bookhub.store import JobStore
 from bookhub.summarizer import (
     GeminiSummarizer,
+    SummaryError,
+    parse_output_full,
     Summary,
     page_groups,
     parse_output,
@@ -621,7 +624,8 @@ def test_gemini_text_book_formats_and_compression(tmp_path):
     assert first.startswith("Книга (файл war.fb2).\nМетаданные файла: название — Война и мир; автор — Лев Толстой.")
     compress = c.requests[1:]
     assert len(compress) == 3 and all(isinstance(r[0], str) for r in compress)  # 16 000+ слов → 3 части
-    assert out[1].fmt == "x4" and out[1].book == "Книга - Автор"
+    # Название и автор из метаданных файла точнее догадки модели — их получают все форматы, и сжатие тоже.
+    assert [o.book for o in out] == ["Война и мир - Лев Толстой"] * 2 and out[1].fmt == "x4"
 
 
 def test_djvu_is_converted(tmp_path):
@@ -670,7 +674,7 @@ def test_live_endpoint_updates_without_reload(tmp_path):
 def test_index_page_has_redesign_parts(tmp_path):
     client, s, app = make(tmp_path, FakeSummarizer())
     html = client.get("/", auth=AUTH).text
-    assert 'data-scene' in html and "<summary" not in html  # пустая библиотека: ролик открыт сразу
+    assert "data-scene" in html and "<details class=\"how\"" not in html  # пустая библиотека: ролик открыт сразу
     assert 'data-version="' in html and 'data-drop' in html and ".fb2.zip" in html
     assert '<script type="module" src="/static/app.js?v=' in html
     upload(client, "a.pdf")
@@ -1183,7 +1187,7 @@ def test_server_error_page(tmp_path, monkeypatch):
     client = TestClient(app, raise_server_exceptions=False)
     monkeypatch.setattr(app.state.store, "list", lambda *a: 1 / 0)
     r = client.get("/", auth=AUTH, headers={"Accept": "text/html"})
-    assert r.status_code == 500 and "Ошибка на сервере" in r.text and "ZeroDivisionError" not in r.text
+    assert r.status_code == 500 and "сломалось на сервере" in r.text and r.headers["content-security-policy"] and "ZeroDivisionError" not in r.text
 
 
 
@@ -1494,3 +1498,108 @@ def test_pathological_markdown_renders_fast():
 def test_heading_in_note_does_not_become_second_h1():
     _, html = render_note("# Глава\n\n## Часть\n")
     assert "<h1>" not in html and "<h2>Глава</h2>" in html
+
+
+def test_network_errors_are_retried():
+    import httpx
+
+    calls = []
+
+    class Flaky(FakeClient):
+        def __init__(self, api_key):
+            super().__init__(api_key)
+            real = self.models.generate_content
+
+            def gen(model, contents):
+                calls.append(1)
+                if len(calls) < 3:
+                    raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+                return real(model, contents)
+
+            self.models.generate_content = gen
+
+    g = GeminiSummarizer("k", "m", None, client_factory=Flaky, sleep=lambda s: None)
+    assert g._generate(["x", "промпт"]) and len(calls) == 3
+
+
+def test_finished_compression_parts_are_not_paid_twice(tmp_path):
+    text_file = tmp_path / "b.txt"
+    text_file.write_text("\n\n".join(["слово " * 100] * 130), "utf-8")  # 13 000 слов → 3 части
+    clients = []
+
+    class Breaks(FakeClient):
+        def __init__(self, api_key):
+            super().__init__(api_key)
+            clients.append(self)
+            real = self.models.generate_content
+
+            def gen(model, contents):
+                if len(clients) == 1 and len(self.requests) == 2:  # первый запуск падает на 3-й части
+                    raise RuntimeError("сбой")
+                return real(model, contents)
+
+            self.models.generate_content = gen
+
+    def run_once():
+        g = GeminiSummarizer("k", "m", None, client_factory=Breaks, sleep=lambda s: None)
+        g.parts_dir = tmp_path / "parts"
+        return list(g.run("file", text_file, ["x2"], None, lambda t: None))
+
+    with pytest.raises(RuntimeError):
+        run_once()
+    out = run_once()
+    assert len(clients[1].requests) == 1 and out[0].fmt == "x2"  # заново оплачена только упавшая часть
+    assert not any((tmp_path / "parts").iterdir())  # после успеха части удалены
+
+
+def test_human_error_hides_technical_english():
+    import httpx
+
+    from bookhub.worker import human_error
+
+    assert "Повторить" in human_error(httpx.ReadTimeout("timed out"))
+    err = RuntimeError("Bad Request")
+    err.code = 400
+    assert human_error(err).startswith("Gemini отклонил запрос")
+    assert "журнале" in human_error(KeyError("x"))
+    assert human_error(SummaryError("Файл EPUB повреждён")) == "Файл EPUB повреждён"
+
+
+def test_long_title_keeps_author_and_frontmatter_keeps_symbols():
+    name, raw, _ = parse_output_full("FILENAME: " + "Очень длинное название " * 10 + "- Анна Тестова\nтекст", "x")
+    assert name.endswith(" - Анна Тестова") and len(name.split(" - ")[0]) <= 100
+    s = Summary("summary", *parse_output_full("FILENAME: C#: Том 1 [черновик] - О'Нил\nтекст", "x")[:1], "",
+                shown=parse_output_full("FILENAME: C#: Том 1 [черновик] - О'Нил\nтекст", "x")[1])
+    assert s.title == "C#: Том 1 [черновик]" and s.author == "О'Нил" and "#" not in s.book
+
+
+def test_control_characters_do_not_break_name_or_yaml():
+    name, raw, body = parse_output_full("FILENAME: Книга\x7f с переносом\u0085 - Автор​\nТекст", "x")
+    assert name == "Книга с переносом - Автор" and raw == "Книга с переносом - Автор" and body == "Текст\n"
+    assert parse_output_full("FILENAME: Неизвестно - Неизвестно\nт", "Имя файла")[0] == "Имя файла"
+
+
+def test_note_names_differing_only_in_case_do_not_collide(tmp_path):
+    (tmp_path / "Книга - Автор.md").write_text("x", "utf-8")
+    assert unique_path(tmp_path, "книга - автор", ".md").name == "книга - автор (2).md"
+
+
+def test_fb2_tables_and_html_chapter_limit(tmp_path, monkeypatch):
+    import bookhub.extract as ex
+
+    fb2 = tmp_path / "t.fb2"
+    fb2.write_text('<?xml version="1.0" encoding="utf-8"?><FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
+                   "<body><section><p>" + "Текст книги. " * 30 + "</p><table><tr><th>Полка</th><th>Книг</th></tr>"
+                   "<tr><td>А-1</td><td>120</td></tr></table></section></body></FictionBook>", "utf-8")
+    assert "Полка | Книг\nА-1 | 120" in extract_text(fb2).text
+    monkeypatch.setattr(ex, "MAX_HTML", 100)
+    with pytest.raises(ex.TooLarge):
+        ex.html_to_text(b"<p>" + b"a" * 200 + b"</p>")
+
+
+def test_created_is_a_yaml_date(tmp_path):
+    client, s, app = make(tmp_path, FakeSummarizer())
+    upload(client, "a.pdf")
+    run_queue(app)
+    text = next(s.books_dir.glob("*.md")).read_text("utf-8")
+    assert re.search(r"^created: \d{4}-\d{2}-\d{2}$", text, re.M)
