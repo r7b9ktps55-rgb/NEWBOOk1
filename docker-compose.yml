@@ -4,6 +4,19 @@ services:
     container_name: bookhub
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Доверять X-Forwarded-For только от Caddy (его адрес закреплён ниже). Пусто или «*» здесь
+      # опасно: за прокси все посетители выглядели бы одним адресом, и чужие неверные пароли
+      # блокировали бы вход владельцу; «*» позволил бы подделывать адрес в обход Caddy.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.30.57.10}
+    networks:
+      - web
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Разбор огромной книги не должен съесть всю память сервера
+    mem_limit: ${MEM_LIMIT:-2g}
     ports:
       # По умолчанию сайт доступен только с этого компьютера.
       # Чтобы открыть его в локальной сети, поставьте BIND=0.0.0.0 в .env.
@@ -27,8 +40,14 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp"
     environment:
-      DOMAIN: ${DOMAIN:-}
+      DOMAIN: ${DOMAIN:-localhost}
+    networks:
+      web:
+        ipv4_address: 172.30.57.10
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -40,6 +59,12 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  web:
+    ipam:
+      config:
+        - subnet: 172.30.57.0/24
 
 volumes:
   caddy-data:

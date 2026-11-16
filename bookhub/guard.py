@@ -9,7 +9,7 @@ import binascii
 import logging
 import secrets
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from html import escape
 
 from fastapi.exceptions import HTTPException
@@ -42,7 +42,7 @@ class LoginLimiter:
         self.window = window
         self.clock = clock
         self.fail_delay = fail_delay
-        self._fails: dict[str, deque] = {}
+        self._fails: OrderedDict[str, deque] = OrderedDict()
 
     def _recent(self, ip: str) -> deque | None:
         q = self._fails.get(ip)
@@ -60,10 +60,19 @@ class LoginLimiter:
         q = self._recent(ip)
         return q is not None and len(q) >= self.attempts
 
+    MAX_ADDRESSES = 10_000
+
     def fail(self, ip: str) -> None:
-        if len(self._fails) > 10_000:  # защита памяти от перебора с множества адресов
-            self._fails.clear()
-        self._fails.setdefault(ip, deque()).append(self.clock())
+        q = self._fails.get(ip)
+        if q is None:
+            # Защита памяти от перебора с множества адресов: вытесняем самые давние адреса,
+            # а не стираем все счётчики сразу (иначе перебор сбрасывал бы блокировки).
+            while len(self._fails) >= self.MAX_ADDRESSES:
+                self._fails.popitem(last=False)
+            q = self._fails[ip] = deque()
+        else:
+            self._fails.move_to_end(ip)
+        q.append(self.clock())
 
     def success(self, ip: str) -> None:
         """Ничего не обнуляет: неудачи истекают по окну времени (см. описание класса)."""
@@ -146,13 +155,22 @@ class GuardMiddleware:
 
 
 async def reply(send, status: int, text: str, extra: list[tuple[bytes, bytes]] | None = None) -> None:
-    body = f'<!doctype html><meta charset="utf-8"><title>Book Hub</title><p>{escape(text)}</p>'.encode()
+    titles = {401: "Вход", 429: "Подождите", 413: "Слишком большой запрос", 400: "Ошибка запроса"}
+    body = (
+        '<!doctype html><html lang="ru"><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<meta name="robots" content="noindex">'
+        f"<title>{titles.get(status, 'Ошибка')} — Book Hub</title>"
+        f'<p style="font:1.1rem/1.5 system-ui,sans-serif;margin:2rem 1rem">{escape(text)}</p></html>'
+    ).encode()
     headers = [
         (b"content-type", b"text/html; charset=utf-8"),
         (b"content-length", str(len(body)).encode()),
         (b"cache-control", b"no-store"),
         (b"x-content-type-options", b"nosniff"),
-        (b"content-security-policy", b"default-src 'none'"),
+        (b"content-security-policy", b"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"),
+        (b"referrer-policy", b"same-origin"),
+        (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
         *(extra or []),
     ]
     await send({"type": "http.response.start", "status": status, "headers": headers})
