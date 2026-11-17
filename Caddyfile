@@ -1,0 +1,25 @@
+# HTTPS-прокси для Book Hub. Сертификат Let's Encrypt Caddy получает и продлевает сам.
+# Домен берётся из DOMAIN в .env (если пусто — localhost с локальным сертификатом).
+{$DOMAIN:localhost} {
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Robots-Tag "noindex, nofollow"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		-Server
+		-Via
+	}
+	# Сайт личный: поисковикам — запрет индексации.
+	respond /robots.txt "User-agent: *
+Disallow: /
+" 200
+	# Проверка здоровья нужна только Docker (он обращается к контейнеру напрямую).
+	respond /health 404
+	request_body {
+		# Чуть больше лимита приложения (5 файлов × MAX_UPLOAD_MB + 1 МиБ), чтобы ответ о размере дал сайт.
+		max_size 1100MiB
+	}
+	reverse_proxy bookhub:8080 {
+		header_down -Server
+	}
+}

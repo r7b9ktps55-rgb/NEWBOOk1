@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}{{ title }} — Book Hub{% endblock %}
+{% block content %}
+<section class="error-page" aria-labelledby="error-title">
+  <span class="caps">Ошибка {{ status }}</span>
+  <h1 class="display" id="error-title">{{ title }}</h1>
+  <p class="lead">{{ detail }}</p>
+  <a class="btn primary" href="/">На главную</a>
+</section>
+{% endblock %}
